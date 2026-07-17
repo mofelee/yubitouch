@@ -98,6 +98,11 @@ Desktop App Integration，不使用 service account token。SDK 返回不可变 
 因此无法形式化保证原地清零；YubiTouch 把解析限制在一次性 AskPass helper 进程中，
 写入 OpenSSH AskPass 管道后立即退出。
 
+在 1Password 模式下，`yubitouch doctor` 会本地校验 secret reference 语法，并初始化
+Desktop App Integration client 来验证账户和桌面集成；这可能触发 1Password 自己的授权
+界面，但不会解析或读取 PIN，也不会加载 YKCS11。只有显式 `yubitouch test-sign` 才会通过
+一次性 AskPass helper 调用 `Secrets().Resolve`，验证引用存在性和完整授权链路。
+
 其他支持的覆盖变量：
 
 - `YUBITOUCH_CONFIG`

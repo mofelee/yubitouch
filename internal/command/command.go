@@ -23,6 +23,7 @@ import (
 	"github.com/mofelee/yubitouch/internal/daemon"
 	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/launchagent"
+	"github.com/mofelee/yubitouch/internal/pin"
 	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/state"
 	"github.com/mofelee/yubitouch/internal/system"
@@ -298,8 +299,17 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 		check(!sshReport.HasMatchExec, "side-effect-free SSH config", "no YubiTouch Match exec directive")
 	}
 	if cfg.PINProvider == config.PINProvider1Password {
-		check(strings.TrimSpace(cfg.OnePasswordAccount) != "", "1Password account", "configured")
-		check(strings.HasPrefix(cfg.OnePasswordRef, "op://"), "1Password reference", "configured and redacted")
+		onePasswordCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		onePasswordErr := pin.CheckOnePassword(onePasswordCtx, cfg)
+		cancel()
+		switch {
+		case onePasswordErr == nil:
+			check(true, "1Password Desktop App Integration", "account connected; secret reference syntax is valid")
+		case errors.Is(onePasswordErr, pin.ErrInvalidSecretReference):
+			check(false, "1Password secret reference", "syntax is invalid; update YUBITOUCH_1PASSWORD_REF and run configure again")
+		default:
+			check(false, "1Password Desktop App Integration", "unlock 1Password, verify the configured account, and enable Integrate with other apps")
+		}
 	}
 
 	if failed {
