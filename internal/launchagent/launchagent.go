@@ -9,12 +9,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"howett.net/plist"
 )
 
 const Label = "com.github.mofelee.yubitouch"
+
+const launchctlRetryDelay = 50 * time.Millisecond
+
+var runLaunchctl = command
 
 type launchdPlist struct {
 	Label                  string   `plist:"Label"`
@@ -79,13 +84,13 @@ func Ensure(ctx context.Context, home string, executable string, configPath stri
 		return err
 	}
 	target := serviceTarget()
-	if command(ctx, "print", target) == nil {
-		return command(ctx, "kickstart", target)
+	if runLaunchctl(ctx, "print", target) == nil {
+		return runLaunchctl(ctx, "kickstart", target)
 	}
-	if err := command(ctx, "bootstrap", domainTarget(), path); err != nil {
+	if err := bootstrap(ctx, path); err != nil {
 		return err
 	}
-	return command(ctx, "kickstart", target)
+	return runLaunchctl(ctx, "kickstart", target)
 }
 
 func Reload(ctx context.Context, home string, executable string, configPath string) error {
@@ -93,22 +98,43 @@ func Reload(ctx context.Context, home string, executable string, configPath stri
 	if err != nil {
 		return err
 	}
-	_ = command(ctx, "bootout", serviceTarget())
-	if err := command(ctx, "bootstrap", domainTarget(), path); err != nil {
+	_ = runLaunchctl(ctx, "bootout", serviceTarget())
+	if err := bootstrap(ctx, path); err != nil {
 		return err
 	}
-	return command(ctx, "kickstart", serviceTarget())
+	return runLaunchctl(ctx, "kickstart", serviceTarget())
 }
 
 func Stop(ctx context.Context) error {
 	if !IsLoaded(ctx) {
 		return nil
 	}
-	return command(ctx, "bootout", serviceTarget())
+	return runLaunchctl(ctx, "bootout", serviceTarget())
 }
 
 func IsLoaded(ctx context.Context) bool {
-	return command(ctx, "print", serviceTarget()) == nil
+	return runLaunchctl(ctx, "print", serviceTarget()) == nil
+}
+
+func bootstrap(ctx context.Context, path string) error {
+	for {
+		err := runLaunchctl(ctx, "bootstrap", domainTarget(), path)
+		if err == nil || !transientBootstrapError(err) {
+			return err
+		}
+		timer := time.NewTimer(launchctlRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("launchctl bootstrap retry: %w (last error: %v)", ctx.Err(), err)
+		case <-timer.C:
+		}
+	}
+}
+
+func transientBootstrapError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "bootstrap failed: 5") || strings.Contains(message, "input/output error")
 }
 
 func WaitForSocket(ctx context.Context, path string) error {
