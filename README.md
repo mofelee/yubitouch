@@ -232,11 +232,13 @@ Host production-* bastion
 读取 SSH config 的第三方程序可直接使用同一 socket。`ssh -G`、密钥列表查询以及没有
 新签名的 ControlMaster 复用不会请求 PIN 或显示触摸提示。
 
-### DebianForm
+### [DebianForm](https://github.com/mofelee/debianform)
 
-DebianForm 无需 YubiTouch wrapper 或专用集成。让它继续使用系统 SSH 配置，并让目标 Host
-匹配上面的 `IdentityAgent`、`IdentityFile` 和 `IdentitiesOnly` 即可。DebianForm 发起新的
-SSH 签名时会出现触摸提示；复用已有连接而没有新签名时不显示提示是预期行为。
+[DebianForm](https://github.com/mofelee/debianform) 是一个通过 OpenSSH 管理 Debian/Ubuntu
+主机的声明式配置管理 CLI，不是 SSH 客户端 GUI。它无需 YubiTouch wrapper 或专用集成。
+让它继续使用系统 SSH 配置，并让目标 Host 匹配上面的 `IdentityAgent`、`IdentityFile` 和
+`IdentitiesOnly` 即可。DebianForm 发起新的 SSH 签名时会出现触摸提示；复用已有连接而没有
+新签名时不显示提示是预期行为。
 
 完成本地验证后可直接测试配置与登录：
 
