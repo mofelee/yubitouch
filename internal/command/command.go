@@ -459,7 +459,7 @@ func reportSignFailure(stderr io.Writer, failureClass string, configPath string)
 		fmt.Fprintln(stderr, "the loaded PIV 9A key does not match the configured public key; run yubitouch doctor")
 		return ExitKeyMismatch
 	case diagnostic.FailureTimeout:
-		fmt.Fprintln(stderr, "the signature request timed out; retry and touch the YubiKey when prompted")
+		fmt.Fprintln(stderr, "the signature request timed out; retry and complete PIN authorization or touch the YubiKey when prompted")
 		return ExitSignTimeout
 	case diagnostic.FailureCanceled:
 		fmt.Fprintln(stderr, "the signature request was canceled; retry yubitouch test-sign")

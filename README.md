@@ -150,6 +150,12 @@ Desktop App Integration client 来验证账户和桌面集成；这可能触发 
 界面，但不会解析或读取 PIN，也不会加载 YKCS11。只有显式 `yubitouch test-sign` 才会通过
 一次性 AskPass helper 调用 `Secrets().Resolve`，验证引用存在性和完整授权链路。
 
+1Password Go SDK v0.4.0 的 macOS Desktop App Integration backend 不响应调用方的
+`context.Context` 取消（上游 [#266](https://github.com/1Password/onepassword-sdk-go/issues/266)）。
+YubiTouch 超时时会终止自己的 `ssh-add` 和一次性 AskPass helper 并返回退出码 6，但
+1Password 应用拥有的授权窗口可能继续显示，需要用户在 1Password 中手动取消。YubiTouch
+不会通过辅助功能或 UI 自动化操作 1Password 窗口；升级 SDK 前必须重新验证该上游限制。
+
 其他支持的覆盖变量：
 
 - `YUBITOUCH_CONFIG`
@@ -276,6 +282,7 @@ yubitouch version         显示版本和提交信息
 | PIV 9A key 不匹配 | 重新执行 9A 公钥导出；不要选择 RSA Attestation key。 |
 | prompt PIN 被取消或不可显示 | 在 Aqua 图形会话重试；TTY fallback 也不可用时不会后台等待。 |
 | 1Password 初始化失败 | 解锁桌面应用，启用 Integrate with other apps，检查 account/reference 后重新 `configure`。 |
+| 1Password 授权超时后窗口仍显示 | YubiTouch 已终止自己的 helper；在 1Password 中手动取消该窗口。当前 SDK 上游 #266 不响应 context 取消。 |
 | 签名超时 | 保持设备连接，在提示出现后触摸；YubiTouch 不会自动重试该请求。 |
 | 配置或路径修改后行为未变化 | 重新 `configure`，再运行 `yubitouch reload`。 |
 | stale socket/backend 错误 | 先 `yubitouch stop`，确认受管服务停止后再 `yubitouch ensure`；不要手工杀死未知 agent。 |

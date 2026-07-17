@@ -56,6 +56,11 @@ go list -m github.com/1Password/onepassword-sdk-go
 1Password 模式另验证：桌面应用集成启用/禁用、Touch ID、用户取消、超时、错误账户和错误
 reference。确认未安装 `op` CLI 时仍可工作，失败时不会回退到 prompt。
 
+超时验收区分进程清理与外部 UI：YubiTouch 必须按时返回、终止自己的 `ssh-add`/AskPass
+进程且不进入 YubiKey Touch；1Password Go SDK v0.4.0 的 macOS backend 当前不响应 context
+取消（上游 #266），因此 1Password 自己拥有的授权窗口可能需要用户手动取消。记录该现象，
+但不得用 UI 自动化代替 SDK 取消能力。
+
 ## LaunchAgent 与无副作用查询
 
 1. 运行 `yubitouch ensure`，确认 plist 位于
