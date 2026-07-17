@@ -2,7 +2,9 @@ package command
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,7 +24,13 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 		"YUBITOUCH_SOCKET":         filepath.Join("/tmp", "yt-command-test-agent.sock"),
 		"YUBITOUCH_BACKEND_SOCKET": filepath.Join("/tmp", "yt-command-test-backend.sock"),
 	}
-	env := Environment{Home: home, Getenv: func(name string) string { return values[name] }}
+	env := Environment{
+		Home:   home,
+		Getenv: func(name string) string { return values[name] },
+		ProbeYubiKeys: func(context.Context) (int, error) {
+			return 1, nil
+		},
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"configure"}, &stdout, &stderr, env); code != ExitOK {
@@ -51,8 +59,22 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 	if status.ProviderState != "not_loaded" {
 		t.Fatalf("provider state = %q", status.ProviderState)
 	}
+	if status.YubiKeyState != "connected" || status.YubiKeyCount != 1 {
+		t.Fatalf("YubiKey status = %+v", status)
+	}
 	if status.DiagnosticLog != logPath || status.LogPermissions != "0600" || status.LogSizeBytes != 3 {
 		t.Fatalf("diagnostic log status = %+v", status)
+	}
+}
+
+func TestYubiKeyStateDistinguishesMissingFromProbeFailure(t *testing.T) {
+	state, count := yubiKeyState(0, nil)
+	if state != "not_detected" || count != 0 {
+		t.Fatalf("missing state = %q, %d", state, count)
+	}
+	state, count = yubiKeyState(2, errors.New("probe failed"))
+	if state != "probe_unavailable" || count != 0 {
+		t.Fatalf("failed state = %q, %d", state, count)
 	}
 }
 

@@ -12,6 +12,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+var (
+	ErrYKManUnavailable = errors.New("ykman is not installed")
+	ErrDeviceProbe      = errors.New("cannot query connected YubiKeys")
+)
+
 type HardwareReport struct {
 	DeviceCount       int
 	SlotAlgorithm     string
@@ -21,18 +26,51 @@ type HardwareReport struct {
 	OtherProviderKeys int
 }
 
+func ProbeYubiKeys(ctx context.Context) (int, error) {
+	return probeYubiKeys(ctx, exec.LookPath, commandOutput)
+}
+
+type pathLookup func(string) (string, error)
+
+type outputRunner func(context.Context, string, ...string) ([]byte, []byte, error)
+
+func probeYubiKeys(ctx context.Context, lookup pathLookup, run outputRunner) (int, error) {
+	ykman, err := lookup("ykman")
+	if err != nil {
+		return 0, ErrYKManUnavailable
+	}
+	serialOutput, diagnosticOutput, err := run(ctx, ykman, "list", "--serials")
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrDeviceProbe, err)
+	}
+	count := countNonEmptyLines(serialOutput)
+	if count == 0 && len(bytes.TrimSpace(diagnosticOutput)) != 0 {
+		return 0, ErrDeviceProbe
+	}
+	return count, nil
+}
+
+func commandOutput(ctx context.Context, path string, args ...string) ([]byte, []byte, error) {
+	cmd := exec.CommandContext(ctx, path, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
 func InspectHardware(ctx context.Context, cfg config.Config, deps Dependencies) (HardwareReport, error) {
-	ykman, err := exec.LookPath("ykman")
+	deviceCount, err := ProbeYubiKeys(ctx)
 	if err != nil {
-		return HardwareReport{}, errors.New("ykman is not installed")
+		return HardwareReport{}, err
 	}
-	serialOutput, err := exec.CommandContext(ctx, ykman, "list", "--serials").Output()
-	if err != nil {
-		return HardwareReport{}, fmt.Errorf("cannot query connected YubiKeys: %w", err)
-	}
-	report := HardwareReport{DeviceCount: countNonEmptyLines(serialOutput)}
+	report := HardwareReport{DeviceCount: deviceCount}
 	if report.DeviceCount == 0 {
 		return report, errors.New("no YubiKey was detected")
+	}
+	ykman, err := exec.LookPath("ykman")
+	if err != nil {
+		return report, ErrYKManUnavailable
 	}
 
 	metadata, err := exec.CommandContext(ctx, ykman, "piv", "keys", "info", "9a").Output()

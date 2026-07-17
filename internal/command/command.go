@@ -37,21 +37,30 @@ const (
 	ExitPINFailure    = 4
 	ExitKeyMismatch   = 5
 	ExitSignTimeout   = 6
+
+	yubiKeyNotChecked       = "not_checked"
+	yubiKeyConnected        = "connected"
+	yubiKeyNotDetected      = "not_detected"
+	yubiKeyProbeUnavailable = "probe_unavailable"
 )
 
 type Environment struct {
-	Home   string
-	Getenv func(string) string
+	Home          string
+	Getenv        func(string) string
+	ProbeYubiKeys func(context.Context) (int, error)
 }
 
 func OS() Environment {
 	home, _ := os.UserHomeDir()
-	return Environment{Home: home, Getenv: os.Getenv}
+	return Environment{Home: home, Getenv: os.Getenv, ProbeYubiKeys: system.ProbeYubiKeys}
 }
 
 func Run(args []string, stdout io.Writer, stderr io.Writer, env Environment) int {
 	if env.Getenv == nil {
 		env.Getenv = func(string) string { return "" }
+	}
+	if env.ProbeYubiKeys == nil {
+		env.ProbeYubiKeys = system.ProbeYubiKeys
 	}
 	if env.Home == "" {
 		fmt.Fprintln(stderr, "yubitouch: cannot determine the user home directory")
@@ -118,6 +127,8 @@ type Status struct {
 	DiagnosticLog     string `json:"diagnostic_log,omitempty"`
 	LogPermissions    string `json:"log_permissions,omitempty"`
 	LogSizeBytes      int64  `json:"log_size_bytes,omitempty"`
+	YubiKeyState      string `json:"yubikey_state"`
+	YubiKeyCount      int    `json:"yubikey_count"`
 }
 
 func runConfigure(stdout io.Writer, stderr io.Writer, env Environment) int {
@@ -143,6 +154,7 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 		Version:       buildinfo.Version,
 		ConfigPath:    path,
 		ProviderState: "not_loaded",
+		YubiKeyState:  yubiKeyNotChecked,
 	}
 	if info, err := os.Lstat(path); err == nil {
 		status.Configured = true
@@ -173,6 +185,10 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	}
 	status.PINProvider = string(cfg.PINProvider)
 	status.PublicKey = cfg.Fingerprint()
+	deviceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	deviceCount, deviceErr := env.ProbeYubiKeys(deviceCtx)
+	cancel()
+	status.YubiKeyState, status.YubiKeyCount = yubiKeyState(deviceCount, deviceErr)
 	if status.BackendReachable {
 		status.ProviderState = "unknown"
 	}
@@ -199,6 +215,11 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	fmt.Fprintf(stdout, "Provider: %s\n", status.ProviderState)
 	fmt.Fprintf(stdout, "PIN provider: %s\n", status.PINProvider)
 	fmt.Fprintf(stdout, "Public key: %s\n", status.PublicKey)
+	fmt.Fprintf(stdout, "YubiKey: %s", status.YubiKeyState)
+	if status.YubiKeyCount > 0 {
+		fmt.Fprintf(stdout, " (%d connected)", status.YubiKeyCount)
+	}
+	fmt.Fprintln(stdout)
 	if status.LogPermissions == "" {
 		fmt.Fprintf(stdout, "Diagnostic log: unavailable (%s)\n", status.DiagnosticLog)
 	} else {
@@ -455,6 +476,16 @@ func availability(ok bool) string {
 		return "reachable"
 	}
 	return "unavailable"
+}
+
+func yubiKeyState(count int, err error) (string, int) {
+	if err != nil {
+		return yubiKeyProbeUnavailable, 0
+	}
+	if count <= 0 {
+		return yubiKeyNotDetected, 0
+	}
+	return yubiKeyConnected, count
 }
 
 func writeJSON(w io.Writer, value any) error {

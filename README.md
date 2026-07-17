@@ -166,6 +166,10 @@ yubitouch test-sign       显式运行 PIN、触摸和签名全链路
 yubitouch about           显示项目身份及无关联声明
 ```
 
+`status` 只通过 `ykman list --serials` 探测设备，并且只输出设备数量，不返回序列号。
+设备状态为 `connected`、`not_detected` 或 `probe_unavailable`；该探测不会加载 YKCS11、
+读取 PIN 或显示触摸提示。
+
 退出码：`0` 成功，`1` 运行错误，`2` 配置错误，`3` 设备不可用，`4` PIN provider
 失败或取消，`5` 目标公钥不匹配，`6` 签名超时或取消。
 
