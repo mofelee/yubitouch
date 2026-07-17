@@ -439,7 +439,9 @@ func lastSignFailureClass(configPath string, since time.Time) string {
 	if persisted.LastSignAt.Before(since) {
 		return ""
 	}
-	if persisted.LastSignEvent != string(signing.EventFailure) && persisted.LastSignEvent != string(signing.EventTimeout) {
+	if persisted.LastSignEvent != string(signing.EventFailure) &&
+		persisted.LastSignEvent != string(signing.EventTimeout) &&
+		persisted.LastSignEvent != string(signing.EventCanceled) {
 		return ""
 	}
 	return persisted.LastFailureClass

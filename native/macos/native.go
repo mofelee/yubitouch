@@ -9,9 +9,11 @@ package macos
 void YTInitializeApplication(void);
 void YTRunApplication(void);
 void YTStopApplication(void);
-void YTShowWaiting(const char *soundName);
-void YTShowSuccess(void);
-void YTShowFailure(const char *message);
+void YTShowWaiting(const char *soundName, unsigned long long requestID);
+void YTShowSuccess(unsigned long long requestID);
+void YTShowFailure(const char *message, unsigned long long requestID);
+void YTHide(unsigned long long requestID);
+unsigned long long YTConsumeCancelRequest(void);
 void YTShowAbout(void);
 char *YTPromptPIN(int *status);
 */
@@ -37,20 +39,28 @@ func StopApplication() {
 	C.YTStopApplication()
 }
 
-func ShowWaiting(sound string) {
+func ShowWaiting(sound string, requestID uint64) {
 	value := C.CString(sound)
 	defer C.free(unsafe.Pointer(value))
-	C.YTShowWaiting(value)
+	C.YTShowWaiting(value, C.ulonglong(requestID))
 }
 
-func ShowSuccess() {
-	C.YTShowSuccess()
+func ShowSuccess(requestID uint64) {
+	C.YTShowSuccess(C.ulonglong(requestID))
 }
 
-func ShowFailure(message string) {
+func ShowFailure(message string, requestID uint64) {
 	value := C.CString(message)
 	defer C.free(unsafe.Pointer(value))
-	C.YTShowFailure(value)
+	C.YTShowFailure(value, C.ulonglong(requestID))
+}
+
+func Hide(requestID uint64) {
+	C.YTHide(C.ulonglong(requestID))
+}
+
+func ConsumeCancelRequest() uint64 {
+	return uint64(C.YTConsumeCancelRequest())
 }
 
 func ShowAbout() {

@@ -135,6 +135,24 @@ func TestLastSignFailureClassRejectsStaleState(t *testing.T) {
 	}
 }
 
+func TestLastSignFailureClassAcceptsCanceledState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	store := state.NewStore(filepath.Join(dir, "state.json"))
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().UTC()
+	store.Handle(signing.Event{
+		Type: signing.EventCanceled,
+		At:   since.Add(time.Second),
+		Err:  signing.ErrCanceled,
+	})
+	if got := lastSignFailureClass(configPath, since); got != "canceled" {
+		t.Fatalf("canceled failure class = %q", got)
+	}
+}
+
 func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	signAt := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	persisted := state.State{

@@ -39,6 +39,7 @@ const (
 	EventSignSucceeded    Event = "sign_succeeded"
 	EventSignFailed       Event = "sign_failed"
 	EventSignTimedOut     Event = "sign_timed_out"
+	EventSignCanceled     Event = "sign_canceled"
 	EventLogReset         Event = "log_size_limit_reached"
 )
 
@@ -206,6 +207,7 @@ func validEvent(event Event) bool {
 		EventSignSucceeded,
 		EventSignFailed,
 		EventSignTimedOut,
+		EventSignCanceled,
 		EventLogReset:
 		return true
 	default:
@@ -311,6 +313,8 @@ func (s SigningSink) Handle(event signing.Event) {
 		_ = s.logger.Write(LevelInfo, EventSignSucceeded, FailureNone)
 	case signing.EventTimeout:
 		_ = s.logger.Write(LevelError, EventSignTimedOut, FailureTimeout)
+	case signing.EventCanceled:
+		_ = s.logger.Write(LevelInfo, EventSignCanceled, FailureCanceled)
 	case signing.EventFailure:
 		_ = s.logger.Write(LevelError, EventSignFailed, Classify(event.Err))
 	}

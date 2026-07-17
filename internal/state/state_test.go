@@ -41,3 +41,21 @@ func TestStoreWritesOnlyClassifiedState(t *testing.T) {
 		t.Fatal("state persisted a lower-level error")
 	}
 }
+
+func TestStorePersistsCanceledTerminalState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store.Handle(signing.Event{Type: signing.EventCanceled, At: time.Now(), Err: signing.ErrCanceled})
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LastSignEvent != string(signing.EventCanceled) ||
+		loaded.LastFailureClass != "canceled" ||
+		loaded.ProviderState != "unavailable" {
+		t.Fatalf("canceled state = %+v", loaded)
+	}
+}

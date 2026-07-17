@@ -22,12 +22,14 @@ const (
 	EventSuccess      EventType = "success"
 	EventFailure      EventType = "failure"
 	EventTimeout      EventType = "timeout"
+	EventCanceled     EventType = "canceled"
 )
 
 type Event struct {
-	Type EventType
-	At   time.Time
-	Err  error
+	Type      EventType
+	At        time.Time
+	Err       error
+	RequestID uint64
 }
 
 type Sink interface {
@@ -62,6 +64,11 @@ type Coordinator struct {
 
 	stateMu sync.RWMutex
 	last    Event
+
+	activeMu   sync.Mutex
+	activeID   uint64
+	activeNext uint64
+	activeStop context.CancelFunc
 }
 
 func New(initializer Initializer, sink Sink, timeout time.Duration) *Coordinator {
@@ -81,6 +88,10 @@ func New(initializer Initializer, sink Sink, timeout time.Duration) *Coordinator
 }
 
 func (c *Coordinator) Sign(ctx context.Context, call func() (*ssh.Signature, error)) (*ssh.Signature, error) {
+	return c.SignCancelable(ctx, call, nil)
+}
+
+func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -92,20 +103,34 @@ func (c *Coordinator) Sign(ctx context.Context, call func() (*ssh.Signature, err
 	case <-ctx.Done():
 		return nil, contextError(ctx)
 	}
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	activeID := c.beginActive(cancelRequest)
+	defer func() {
+		cancelRequest()
+		c.endActive(activeID)
+	}()
+	var cancelOnce sync.Once
+	cancelOperation := func() {
+		cancelOnce.Do(func() {
+			if cancelCall != nil {
+				cancelCall()
+			}
+		})
+	}
 
 	result := make(chan Result, 1)
 	go func() {
 		defer func() { <-c.semaphore }()
-		c.publish(Event{Type: EventInitializing, At: c.now()})
-		if err := c.initializer.Ensure(ctx); err != nil {
+		c.publish(Event{Type: EventInitializing, At: c.now(), RequestID: activeID})
+		if err := c.initializer.Ensure(requestCtx); err != nil {
 			result <- Result{Err: err}
 			return
 		}
-		if err := ctx.Err(); err != nil {
+		if err := requestCtx.Err(); err != nil {
 			result <- Result{Err: err}
 			return
 		}
-		c.publish(Event{Type: EventWaiting, At: c.now()})
+		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID})
 		sig, err := call()
 		if err != nil {
 			if invalidator, ok := c.initializer.(Invalidator); ok {
@@ -119,29 +144,59 @@ func (c *Coordinator) Sign(ctx context.Context, call func() (*ssh.Signature, err
 	case got := <-result:
 		if got.Err != nil {
 			if errors.Is(got.Err, context.DeadlineExceeded) {
+				cancelOperation()
 				err := ErrTimeout
-				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err})
+				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID})
 				return nil, err
 			}
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return nil, c.finishContext(ctx)
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				cancelOperation()
+				return nil, c.finishContext(requestCtx, activeID)
 			}
 			if errors.Is(got.Err, context.Canceled) {
-				err := ErrCanceled
-				c.publish(Event{Type: EventFailure, At: c.now(), Err: err})
-				return nil, err
+				cancelOperation()
+				return nil, c.finishContext(requestCtx, activeID)
 			}
-			if errors.Is(ctx.Err(), context.Canceled) {
-				return nil, c.finishContext(ctx)
+			if errors.Is(requestCtx.Err(), context.Canceled) {
+				cancelOperation()
+				return nil, c.finishContext(requestCtx, activeID)
 			}
-			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err})
+			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID})
 			return nil, got.Err
 		}
-		c.publish(Event{Type: EventSuccess, At: c.now()})
+		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID})
 		return got.Signature, nil
-	case <-ctx.Done():
-		return nil, c.finishContext(ctx)
+	case <-requestCtx.Done():
+		cancelOperation()
+		return nil, c.finishContext(requestCtx, activeID)
 	}
+}
+
+func (c *Coordinator) CancelCurrent() bool {
+	c.activeMu.Lock()
+	id := c.activeID
+	c.activeMu.Unlock()
+	return c.Cancel(id)
+}
+
+func (c *Coordinator) Cancel(id uint64) bool {
+	if id == 0 {
+		return false
+	}
+	c.activeMu.Lock()
+	if c.activeID != id {
+		c.activeMu.Unlock()
+		return false
+	}
+	cancel := c.activeStop
+	c.activeID = 0
+	c.activeStop = nil
+	c.activeMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
 }
 
 func (c *Coordinator) LastEvent() Event {
@@ -150,14 +205,32 @@ func (c *Coordinator) LastEvent() Event {
 	return c.last
 }
 
-func (c *Coordinator) finishContext(ctx context.Context) error {
+func (c *Coordinator) finishContext(ctx context.Context, requestID uint64) error {
 	err := contextError(ctx)
 	if errors.Is(err, ErrTimeout) {
-		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err})
+		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID})
 		return err
 	}
-	c.publish(Event{Type: EventFailure, At: c.now(), Err: err})
+	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID})
 	return err
+}
+
+func (c *Coordinator) beginActive(cancel context.CancelFunc) uint64 {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	c.activeNext++
+	c.activeID = c.activeNext
+	c.activeStop = cancel
+	return c.activeID
+}
+
+func (c *Coordinator) endActive(id uint64) {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	if c.activeID == id {
+		c.activeID = 0
+		c.activeStop = nil
+	}
 }
 
 func contextError(ctx context.Context) error {

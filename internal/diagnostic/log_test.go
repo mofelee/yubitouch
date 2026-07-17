@@ -74,6 +74,26 @@ func TestLogLevelFiltersInformationalEvents(t *testing.T) {
 	}
 }
 
+func TestSigningSinkRecordsClassifiedCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yubitouch.log")
+	logger, err := Open(path, "info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	NewSigningSink(logger).Handle(signing.Event{Type: signing.EventCanceled, Err: signing.ErrCanceled})
+	if err := logger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	if !strings.Contains(contents, `"event":"sign_canceled"`) || !strings.Contains(contents, `"failure_class":"canceled"`) {
+		t.Fatalf("cancellation was not classified: %s", contents)
+	}
+}
+
 func TestLogResetsAtSizeLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "yubitouch.log")
 	logger, err := Open(path, "info")

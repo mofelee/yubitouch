@@ -258,9 +258,13 @@ func (a *connectionAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	if err != nil {
 		return nil, err
 	}
-	return a.coordinator.Sign(a.ctx, func() (*ssh.Signature, error) {
-		return backend.SignWithFlags(key, data, flags)
-	})
+	return a.coordinator.SignCancelable(
+		a.ctx,
+		func() (*ssh.Signature, error) {
+			return backend.SignWithFlags(key, data, flags)
+		},
+		a.closeSigningBackend,
+	)
 }
 
 func (a *connectionAgent) Extension(extensionType string, contents []byte) ([]byte, error) {
@@ -330,6 +334,16 @@ func (a *connectionAgent) connectBackendLocked() (Backend, error) {
 	}
 	a.backend = backend
 	return backend, nil
+}
+
+func (a *connectionAgent) closeSigningBackend() {
+	a.mu.Lock()
+	backend := a.backend
+	a.backend = nil
+	a.mu.Unlock()
+	if backend != nil {
+		_ = backend.Close()
+	}
 }
 
 func (a *connectionAgent) close() {

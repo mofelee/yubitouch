@@ -57,9 +57,12 @@ func (s *Store) Handle(event signing.Event) {
 		s.data.ProviderState = "initializing"
 	case signing.EventWaiting, signing.EventSuccess:
 		s.data.ProviderState = "loaded"
-	case signing.EventFailure:
+	case signing.EventFailure, signing.EventCanceled:
 		s.data.ProviderState = "unavailable"
 		failure := diagnostic.Classify(event.Err)
+		if event.Type == signing.EventCanceled {
+			failure = diagnostic.FailureCanceled
+		}
 		if failure == diagnostic.FailureNone {
 			failure = diagnostic.FailureInternal
 		}

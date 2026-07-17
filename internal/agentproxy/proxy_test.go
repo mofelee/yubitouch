@@ -382,7 +382,8 @@ func TestClientDisconnectCancelsQueuedSign(t *testing.T) {
 	first := &blockingBackend{started: make(chan struct{}), release: make(chan struct{})}
 	second := &fakeBackend{}
 	var factories atomic.Int32
-	var secondServerConn net.Conn
+	secondServerConn, secondClientConn := net.Pipe()
+	defer secondClientConn.Close()
 	disconnectSecond := make(chan struct{})
 	server := &Server{
 		TargetKey: target,
@@ -421,7 +422,6 @@ func TestClientDisconnectCancelsQueuedSign(t *testing.T) {
 		t.Fatal("first signature did not start")
 	}
 
-	secondServerConn, secondClientConn := net.Pipe()
 	go server.serveConn(ctx, secondServerConn)
 	secondResult := make(chan error, 1)
 	go func() {
@@ -585,6 +585,54 @@ func TestActiveDisconnectClosesBackendConnection(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("agent server did not stop")
+	}
+}
+
+func TestUserCancellationClosesBackendAndNextRequestReconnects(t *testing.T) {
+	target := newPublicKey(t)
+	first := &cancelableBackend{started: make(chan struct{}), stopped: make(chan struct{})}
+	second := &fakeBackend{}
+	var factories atomic.Int32
+	coordinator := signing.New(nil, nil, time.Second)
+	a := &connectionAgent{
+		ctx:     context.Background(),
+		target:  target,
+		comment: "YubiTouch PIV 9A",
+		backendFactory: func(context.Context) (Backend, error) {
+			if factories.Add(1) == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+		coordinator: coordinator,
+	}
+	defer a.close()
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := a.Sign(target, []byte("first request"))
+		firstResult <- err
+	}()
+	select {
+	case <-first.started:
+	case <-time.After(time.Second):
+		t.Fatal("first signature did not start")
+	}
+	if !coordinator.CancelCurrent() {
+		t.Fatal("active signature was not canceled")
+	}
+	if err := <-firstResult; !errors.Is(err, signing.ErrCanceled) {
+		t.Fatalf("first error = %v, want canceled", err)
+	}
+	if !first.closed.Load() {
+		t.Fatal("canceled backend connection was not closed")
+	}
+
+	if _, err := a.Sign(target, []byte("second request")); err != nil {
+		t.Fatalf("next signature failed: %v", err)
+	}
+	if factories.Load() != 2 || second.signCount.Load() != 1 {
+		t.Fatalf("factories=%d second_signs=%d", factories.Load(), second.signCount.Load())
 	}
 }
 

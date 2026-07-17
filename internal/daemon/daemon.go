@@ -73,6 +73,9 @@ func Run(ctx context.Context, options Options) error {
 		app = ui.New(cfg.Sound)
 	}
 	coordinator := signing.New(manager, ui.MultiSink{store, app, diagnostic.NewSigningSink(logger)}, cfg.SignTimeout.Duration)
+	if cancelable, ok := app.(interface{ SetCancelHandler(func(uint64) bool) }); ok {
+		cancelable.SetCancelHandler(coordinator.Cancel)
+	}
 	server := &agentproxy.Server{
 		TargetKey:      cfg.PublicKey,
 		Comment:        "YubiTouch PIV 9A",

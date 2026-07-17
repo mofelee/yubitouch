@@ -48,6 +48,7 @@ go list -m github.com/1Password/onepassword-sdk-go
 | 成功签名 | pending | pending | 0 | pending | 0 |  |
 | PIN provider 用户取消 | pending | pending | 4 | pending | 0 |  |
 | 客户端取消签名 | pending | pending | 6 | pending | 0 |  |
+| 触摸浮层主动取消 | pending | pending | 6 | immediate close | 0 |  |
 | 错误 PIN | pending | pending | 4 | pending | 0 |  |
 | 触摸超时 | pending | pending | 6 | pending | 0 |  |
 | 设备移除/重插 | pending | pending | 3 | pending | 0 |  |
@@ -104,7 +105,8 @@ DebianForm 只配置普通 SSH Host/IdentityAgent/IdentityFile，不安装 wrapp
 ## UI 与安全检查
 
 在普通桌面、多 Space 和全屏应用中检查等待、成功、失败和超时状态。确认提示不抢焦点，
-成功由签名结果关闭，设备移除显示失败，多个并发请求不会叠加窗口。
+成功由签名结果关闭，设备移除显示失败，多个并发请求不会叠加窗口。点击取消按钮后浮层
+立即关闭、调用方失败且没有成功状态；随后排队请求使用自己的按钮/request ID，不能被旧点击取消。
 
 人工检查 `ps`、进程环境、`config.json`、`state.json`、诊断日志和运行目录中的文件名/内容。
 只确认敏感字段不存在，不要把真实 PIN 作为 shell 搜索参数或保存检查输出。报告中只记录
