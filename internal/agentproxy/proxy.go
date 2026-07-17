@@ -7,10 +7,13 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/mofelee/yubitouch/internal/signing"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -33,10 +36,11 @@ type Backend interface {
 type BackendFactory func(context.Context) (Backend, error)
 
 type Server struct {
-	TargetKey      ssh.PublicKey
-	Comment        string
-	BackendFactory BackendFactory
-	Coordinator    *signing.Coordinator
+	TargetKey         ssh.PublicKey
+	Comment           string
+	BackendFactory    BackendFactory
+	Coordinator       *signing.Coordinator
+	disconnectWatcher func(context.Context, net.Conn)
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
@@ -94,9 +98,24 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 }
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	connectionCtx, cancel := context.WithCancel(ctx)
+	watcher := s.disconnectWatcher
+	if watcher == nil {
+		watcher = watchDisconnect
+	}
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		watcher(connectionCtx, conn)
+		cancel()
+	}()
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		<-watcherDone
+	}()
 	frontend := &connectionAgent{
-		ctx:            ctx,
+		ctx:            connectionCtx,
 		target:         s.TargetKey,
 		comment:        s.Comment,
 		backendFactory: s.BackendFactory,
@@ -104,6 +123,68 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 	defer frontend.close()
 	_ = agent.ServeAgent(frontend, conn)
+}
+
+func watchDisconnect(ctx context.Context, conn net.Conn) {
+	syscallConn, ok := conn.(syscall.Conn)
+	if !ok {
+		<-ctx.Done()
+		return
+	}
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		<-ctx.Done()
+		return
+	}
+	for ctx.Err() == nil {
+		disconnected := false
+		readable := false
+		err := raw.Control(func(fd uintptr) {
+			pollFDs := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+			_, pollErr := unix.Poll(pollFDs, 100)
+			if pollErr != nil {
+				if pollErr != unix.EINTR {
+					disconnected = true
+				}
+				return
+			}
+			events := pollFDs[0].Revents
+			if events&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+				disconnected = true
+				return
+			}
+			if events&unix.POLLIN == 0 {
+				return
+			}
+			readable = true
+			var buffer [1]byte
+			n, _, recvErr := unix.Recvfrom(int(fd), buffer[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+			if n == 0 && recvErr == nil {
+				disconnected = true
+				return
+			}
+			if recvErr != nil && recvErr != unix.EAGAIN && recvErr != unix.EWOULDBLOCK && recvErr != unix.EINTR {
+				disconnected = true
+			}
+		})
+		if err != nil || disconnected {
+			return
+		}
+		if readable {
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+			}
+		}
+	}
 }
 
 type connectionAgent struct {

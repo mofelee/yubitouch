@@ -26,6 +26,41 @@ type fakeBackend struct {
 	listFailure atomic.Bool
 }
 
+type blockingBackend struct {
+	fakeBackend
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type cancelableBackend struct {
+	fakeBackend
+	started   chan struct{}
+	stopped   chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+}
+
+func (b *cancelableBackend) SignWithFlags(ssh.PublicKey, []byte, agent.SignatureFlags) (*ssh.Signature, error) {
+	b.signCount.Add(1)
+	b.startOnce.Do(func() { close(b.started) })
+	<-b.stopped
+	return nil, errors.New("backend connection closed")
+}
+
+func (b *cancelableBackend) Close() error {
+	b.fakeBackend.Close()
+	b.stopOnce.Do(func() { close(b.stopped) })
+	return nil
+}
+
+func (b *blockingBackend) SignWithFlags(ssh.PublicKey, []byte, agent.SignatureFlags) (*ssh.Signature, error) {
+	b.signCount.Add(1)
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return &ssh.Signature{Format: ssh.KeyAlgoED25519, Blob: make([]byte, ed25519.SignatureSize)}, nil
+}
+
 func (b *fakeBackend) List() ([]*agent.Key, error) {
 	if b.listFailure.Load() {
 		return nil, errors.New("backend connection is stale")
@@ -238,6 +273,217 @@ func TestServeAgentCreatesBackendPerClient(t *testing.T) {
 			t.Fatalf("backend state did not settle: count=%d", count)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestClientDisconnectCancelsQueuedSign(t *testing.T) {
+	target := newPublicKey(t)
+	first := &blockingBackend{started: make(chan struct{}), release: make(chan struct{})}
+	second := &fakeBackend{}
+	var factories atomic.Int32
+	var secondServerConn net.Conn
+	disconnectSecond := make(chan struct{})
+	server := &Server{
+		TargetKey: target,
+		BackendFactory: func(context.Context) (Backend, error) {
+			if factories.Add(1) == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+		Coordinator: signing.New(nil, nil, time.Second),
+		disconnectWatcher: func(ctx context.Context, conn net.Conn) {
+			if conn == secondServerConn {
+				select {
+				case <-disconnectSecond:
+				case <-ctx.Done():
+				}
+				return
+			}
+			<-ctx.Done()
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstServerConn, firstClientConn := net.Pipe()
+	defer firstClientConn.Close()
+	go server.serveConn(ctx, firstServerConn)
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := agent.NewClient(firstClientConn).Sign(target, []byte("first request"))
+		firstResult <- err
+	}()
+	select {
+	case <-first.started:
+	case <-time.After(time.Second):
+		t.Fatal("first signature did not start")
+	}
+
+	secondServerConn, secondClientConn := net.Pipe()
+	go server.serveConn(ctx, secondServerConn)
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := agent.NewClient(secondClientConn).Sign(target, []byte("second request"))
+		secondResult <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for factories.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("second request did not reach the signing queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = secondClientConn.Close()
+	close(disconnectSecond)
+	select {
+	case err := <-secondResult:
+		if err == nil {
+			t.Fatal("disconnected client unexpectedly received a signature")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disconnected client did not return")
+	}
+	deadline = time.Now().Add(time.Second)
+	for !second.closed.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("queued backend connection was not closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if second.signCount.Load() != 0 {
+		t.Fatalf("queued backend signed %d times", second.signCount.Load())
+	}
+
+	close(first.release)
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first signature did not finish")
+	}
+}
+
+func TestWatchDisconnectDetectsUnixPeerClose(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "yt-disconnect-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	listener, err := net.Listen("unix", filepath.Join(dir, "watch.sock"))
+	if errors.Is(err, syscall.EPERM) {
+		t.Skip("sandbox does not permit Unix socket creation")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := listener.Accept()
+		accepted <- conn
+	}()
+	client, err := net.Dial("unix", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConn := <-accepted
+	if serverConn == nil {
+		t.Fatal("listener did not accept the client")
+	}
+	defer serverConn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		watchDisconnect(ctx, serverConn)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("disconnect watcher returned while the peer was connected")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect watcher did not detect peer close")
+	}
+}
+
+func TestActiveDisconnectClosesBackendConnection(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "yt-active-disconnect-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	listener, err := Listen(filepath.Join(dir, "runtime", "agent.sock"))
+	if errors.Is(err, syscall.EPERM) {
+		t.Skip("sandbox does not permit Unix socket creation")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newPublicKey(t)
+	backend := &cancelableBackend{started: make(chan struct{}), stopped: make(chan struct{})}
+	server := &Server{
+		TargetKey:      target,
+		BackendFactory: func(context.Context) (Backend, error) { return backend, nil },
+		Coordinator:    signing.New(nil, nil, time.Second),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	t.Cleanup(func() { _ = listener.Close() })
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- server.Serve(ctx, listener) }()
+	clientConn, err := net.Dial("unix", listener.Addr().String())
+	if err != nil {
+		cancel()
+		<-serverResult
+		t.Fatal(err)
+	}
+	signResult := make(chan error, 1)
+	go func() {
+		_, err := agent.NewClient(clientConn).Sign(target, []byte("request"))
+		signResult <- err
+	}()
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("signature did not start")
+	}
+	if err := clientConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-signResult:
+		if err == nil {
+			t.Fatal("disconnected client unexpectedly received a signature")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client sign did not return after disconnect")
+	}
+	select {
+	case <-backend.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("backend connection was not closed after client disconnect")
+	}
+	if !backend.closed.Load() {
+		t.Fatal("backend did not record Close")
+	}
+	cancel()
+	select {
+	case err := <-serverResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent server did not stop")
 	}
 }
 

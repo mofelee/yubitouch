@@ -127,3 +127,45 @@ func TestInitializerDeadlineIsNormalized(t *testing.T) {
 		t.Fatalf("last event = %s", got)
 	}
 }
+
+func TestQueuedCancellationDoesNotPublishLifecycle(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(nil, recorder, time.Second)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.Sign(context.Background(), func() (*ssh.Signature, error) {
+			close(started)
+			<-release
+			return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+		})
+		firstResult <- err
+	}()
+	<-started
+
+	queuedCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := coordinator.Sign(queuedCtx, func() (*ssh.Signature, error) {
+		t.Fatal("canceled queued request started")
+		return nil, nil
+	})
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("queued error = %v", err)
+	}
+	got := recorder.types()
+	want := []EventType{EventInitializing, EventWaiting}
+	if len(got) != len(want) {
+		t.Fatalf("events after queued cancellation = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events after queued cancellation = %v", got)
+		}
+	}
+
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+}

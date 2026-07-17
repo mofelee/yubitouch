@@ -90,7 +90,7 @@ func (c *Coordinator) Sign(ctx context.Context, call func() (*ssh.Signature, err
 	select {
 	case c.semaphore <- struct{}{}:
 	case <-ctx.Done():
-		return nil, c.finishContext(ctx)
+		return nil, contextError(ctx)
 	}
 
 	result := make(chan Result, 1)
@@ -151,14 +151,20 @@ func (c *Coordinator) LastEvent() Event {
 }
 
 func (c *Coordinator) finishContext(ctx context.Context) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		err := ErrTimeout
+	err := contextError(ctx)
+	if errors.Is(err, ErrTimeout) {
 		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err})
 		return err
 	}
-	err := ErrCanceled
 	c.publish(Event{Type: EventFailure, At: c.now(), Err: err})
 	return err
+}
+
+func contextError(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return ErrTimeout
+	}
+	return ErrCanceled
 }
 
 func (c *Coordinator) publish(event Event) {
