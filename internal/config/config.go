@@ -257,6 +257,7 @@ func (c *Config) ResolveAndValidate(home string) error {
 	c.PublicKeyPath = expandPath(c.PublicKeyPath, home)
 	c.OpenSSHPrefix = expandPath(c.OpenSSHPrefix, home)
 	c.YKCS11Path = expandPath(c.YKCS11Path, home)
+	c.YKCS11Path = stableYKCS11Path(c.YKCS11Path)
 	c.SocketPath = expandPath(c.SocketPath, home)
 	c.BackendSocketPath = expandPath(c.BackendSocketPath, home)
 
@@ -411,13 +412,21 @@ func defaultYKCS11Path() string {
 	}
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil {
-			if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
-				return resolved
-			}
 			return candidate
 		}
 	}
 	return candidates[0]
+}
+
+func stableYKCS11Path(path string) string {
+	for _, prefix := range []string{"/opt/homebrew", "/usr/local"} {
+		cellar := filepath.Join(prefix, "Cellar", "yubico-piv-tool")
+		relative, err := filepath.Rel(cellar, path)
+		if err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return filepath.Join(prefix, "opt", "yubico-piv-tool", "lib", "libykcs11.dylib")
+		}
+	}
+	return path
 }
 
 func ParseBoolEnvironment(getenv func(string) string, name string) bool {

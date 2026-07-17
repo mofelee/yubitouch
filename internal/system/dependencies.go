@@ -16,11 +16,15 @@ type Dependencies struct {
 }
 
 func Resolve(cfg config.Config) (Dependencies, error) {
+	provider, err := ResolveYKCS11(cfg.YKCS11Path)
+	if err != nil {
+		return Dependencies{}, err
+	}
 	deps := Dependencies{
 		SSHAgent:  filepath.Join(cfg.OpenSSHPrefix, "bin", "ssh-agent"),
 		SSHAdd:    filepath.Join(cfg.OpenSSHPrefix, "bin", "ssh-add"),
 		SSHKeygen: filepath.Join(cfg.OpenSSHPrefix, "bin", "ssh-keygen"),
-		YKCS11:    cfg.YKCS11Path,
+		YKCS11:    provider,
 	}
 	checks := []struct {
 		name string
@@ -41,4 +45,19 @@ func Resolve(cfg config.Config) (Dependencies, error) {
 		}
 	}
 	return deps, nil
+}
+
+func ResolveYKCS11(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("libykcs11 not found at %s: %w", path, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("libykcs11 not found at %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("libykcs11 path is a directory: %s", path)
+	}
+	return resolved, nil
 }

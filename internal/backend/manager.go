@@ -213,13 +213,17 @@ func (m *Manager) targetLoaded(ctx context.Context) (bool, error) {
 }
 
 func (m *Manager) loadProvider(ctx context.Context) error {
+	provider, err := system.ResolveYKCS11(m.cfg.YKCS11Path)
+	if err != nil {
+		return err
+	}
 	guard, err := newGuardPath(filepath.Dir(m.configPath))
 	if err != nil {
 		return err
 	}
 	defer os.Remove(guard)
 
-	cmd := exec.CommandContext(ctx, m.deps.SSHAdd, "-s", m.deps.YKCS11)
+	cmd := exec.CommandContext(ctx, m.deps.SSHAdd, "-s", provider)
 	cmd.Env = append(append([]string{}, m.processEnv...),
 		"SSH_AUTH_SOCK="+m.cfg.BackendSocketPath,
 		"SSH_ASKPASS_REQUIRE=force",
@@ -236,6 +240,7 @@ func (m *Manager) loadProvider(ctx context.Context) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ssh-add could not load YKCS11: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
+	m.deps.YKCS11 = provider
 	return nil
 }
 

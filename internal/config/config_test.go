@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,14 @@ func TestLoadForConfigureAndSave(t *testing.T) {
 	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	providerTarget := filepath.Join(home, "libykcs11.1.dylib")
+	providerLink := filepath.Join(home, "libykcs11.dylib")
+	if err := os.WriteFile(providerTarget, []byte("provider"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(providerTarget), providerLink); err != nil {
+		t.Fatal(err)
+	}
 	values := map[string]string{
 		"YUBITOUCH_PUBLIC_KEY":        keyPath,
 		"YUBITOUCH_PIN_PROVIDER":      "1password",
@@ -25,6 +34,7 @@ func TestLoadForConfigureAndSave(t *testing.T) {
 		"YUBITOUCH_SIGN_TIMEOUT":      "15s",
 		"YUBITOUCH_SOCKET":            filepath.Join("/tmp", "yt-config-test-agent.sock"),
 		"YUBITOUCH_BACKEND_SOCKET":    filepath.Join("/tmp", "yt-config-test-backend.sock"),
+		"YUBITOUCH_YKCS11":            providerLink,
 	}
 	getenv := func(name string) string { return values[name] }
 	path := DefaultPath(home)
@@ -38,6 +48,9 @@ func TestLoadForConfigureAndSave(t *testing.T) {
 	}
 	if cfg.Fingerprint() != ssh.FingerprintSHA256(cfg.PublicKey) || cfg.Fingerprint() == "" {
 		t.Fatal("missing public key fingerprint")
+	}
+	if cfg.YKCS11Path != providerLink {
+		t.Fatalf("provider path was resolved before persistence: %q", cfg.YKCS11Path)
 	}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -59,6 +72,9 @@ func TestLoadForConfigureAndSave(t *testing.T) {
 	}
 	if loaded.Fingerprint() != cfg.Fingerprint() {
 		t.Fatalf("fingerprint changed after reload")
+	}
+	if loaded.YKCS11Path != providerLink {
+		t.Fatalf("stable provider path was not persisted: %q", loaded.YKCS11Path)
 	}
 }
 
@@ -113,5 +129,25 @@ func TestEnsurePrivateDirRepairsPermissions(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o700 {
 		t.Fatalf("runtime mode = %o, want 700", got)
+	}
+}
+
+func TestStableYKCS11PathMigratesHomebrewCellarPaths(t *testing.T) {
+	tests := map[string]string{
+		"/opt/homebrew/Cellar/yubico-piv-tool/2.7.2/lib/libykcs11.2.dylib": "/opt/homebrew/opt/yubico-piv-tool/lib/libykcs11.dylib",
+		"/usr/local/Cellar/yubico-piv-tool/2.7.2/lib/libykcs11.dylib":      "/usr/local/opt/yubico-piv-tool/lib/libykcs11.dylib",
+		"/custom/security/libykcs11.dylib":                                 "/custom/security/libykcs11.dylib",
+	}
+	for input, want := range tests {
+		if got := stableYKCS11Path(input); got != want {
+			t.Fatalf("stableYKCS11Path(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestDefaultsKeepStableProviderPath(t *testing.T) {
+	path := Defaults(t.TempDir()).YKCS11Path
+	if strings.Contains(path, string(filepath.Separator)+"Cellar"+string(filepath.Separator)) {
+		t.Fatalf("default provider path is versioned: %s", path)
 	}
 }
