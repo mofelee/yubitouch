@@ -111,6 +111,19 @@ Desktop App Integration，不使用 service account token。SDK 返回不可变 
 
 修改环境变量后再次运行 `yubitouch configure`，然后运行 `yubitouch reload`。
 
+## 诊断日志
+
+daemon 将有界 JSONL 日志写入 `~/.ssh/yubitouch/yubitouch.log`，权限固定为 `0600`。
+日志达到约 1 MiB 后会在原文件内重置，避免后台服务无限占用磁盘。`log_level` 支持：
+
+- `error`：只记录失败和超时分类。
+- `info`：额外记录 daemon 生命周期与签名结果，默认值。
+- `debug`：额外记录 provider 初始化和等待触摸状态。
+
+日志接口只接受预定义事件和失败分类，不接受任意错误字符串。PIN、PIN 长度、签名请求、
+签名结果、远程主机和完整 1Password secret reference 均不会写入日志。`yubitouch status`
+显示日志路径、权限和大小；`yubitouch doctor` 会检查日志是否为普通的 `0600` 文件。
+
 ## SSH 配置
 
 SSH 配置只指向标准 Agent socket，不需要 wrapper 或 `Match exec`：

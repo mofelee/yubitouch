@@ -2,7 +2,7 @@
 
 build:
 	mkdir -p bin
-	GOCACHE=$${GOCACHE:-/tmp/yubitouch-gocache} go build -o bin/yubitouch ./cmd/yubitouch
+	GOCACHE=$${GOCACHE:-/tmp/yubitouch-gocache} go build -buildvcs=false -o bin/yubitouch ./cmd/yubitouch
 
 app:
 	./scripts/build-app.sh

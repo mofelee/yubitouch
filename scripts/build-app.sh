@@ -20,6 +20,7 @@ cp "$root/assets/YubiTouch-1024.png" "$contents/Resources/YubiTouch-1024.png"
 
 cd "$root"
 GOCACHE=${GOCACHE:-/tmp/yubitouch-gocache} go build \
+  -buildvcs=false \
   -ldflags "-s -w" \
   -o "$contents/MacOS/$executable" \
   "$package"

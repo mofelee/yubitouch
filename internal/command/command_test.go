@@ -31,6 +31,10 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 	if !strings.Contains(stdout.String(), "No PIN was read") {
 		t.Fatalf("unexpected configure output: %s", stdout.String())
 	}
+	logPath := filepath.Join(home, ".ssh", "yubitouch", "yubitouch.log")
+	if err := os.WriteFile(logPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	stdout.Reset()
 	stderr.Reset()
@@ -46,6 +50,9 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 	}
 	if status.ProviderState != "not_loaded" {
 		t.Fatalf("provider state = %q", status.ProviderState)
+	}
+	if status.DiagnosticLog != logPath || status.LogPermissions != "0600" || status.LogSizeBytes != 3 {
+		t.Fatalf("diagnostic log status = %+v", status)
 	}
 }
 

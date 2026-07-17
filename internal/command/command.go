@@ -21,6 +21,7 @@ import (
 	"github.com/mofelee/yubitouch/internal/buildinfo"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/daemon"
+	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/launchagent"
 	"github.com/mofelee/yubitouch/internal/state"
 	"github.com/mofelee/yubitouch/internal/system"
@@ -114,6 +115,9 @@ type Status struct {
 	DaemonPID         int    `json:"daemon_pid,omitempty"`
 	LastSignEvent     string `json:"last_sign_event,omitempty"`
 	LastSignAt        string `json:"last_sign_at,omitempty"`
+	DiagnosticLog     string `json:"diagnostic_log,omitempty"`
+	LogPermissions    string `json:"log_permissions,omitempty"`
+	LogSizeBytes      int64  `json:"log_size_bytes,omitempty"`
 }
 
 func runConfigure(stdout io.Writer, stderr io.Writer, env Environment) int {
@@ -162,6 +166,11 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	status.AgentReachable = socketReachable(cfg.SocketPath)
 	status.BackendSocket = cfg.BackendSocketPath
 	status.BackendReachable = socketReachable(cfg.BackendSocketPath)
+	status.DiagnosticLog = diagnostic.Path(path)
+	if info, err := os.Lstat(status.DiagnosticLog); err == nil && info.Mode().IsRegular() {
+		status.LogPermissions = fmt.Sprintf("%04o", info.Mode().Perm())
+		status.LogSizeBytes = info.Size()
+	}
 	status.PINProvider = string(cfg.PINProvider)
 	status.PublicKey = cfg.Fingerprint()
 	if status.BackendReachable {
@@ -190,6 +199,11 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	fmt.Fprintf(stdout, "Provider: %s\n", status.ProviderState)
 	fmt.Fprintf(stdout, "PIN provider: %s\n", status.PINProvider)
 	fmt.Fprintf(stdout, "Public key: %s\n", status.PublicKey)
+	if status.LogPermissions == "" {
+		fmt.Fprintf(stdout, "Diagnostic log: unavailable (%s)\n", status.DiagnosticLog)
+	} else {
+		fmt.Fprintf(stdout, "Diagnostic log: %s (%s, %d bytes)\n", status.DiagnosticLog, status.LogPermissions, status.LogSizeBytes)
+	}
 	return ExitOK
 }
 
@@ -243,6 +257,10 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 		}
 	}
 	check(socketReachable(cfg.SocketPath), "public agent socket", cfg.SocketPath)
+	logPath := diagnostic.Path(path)
+	logInfo, logErr := os.Lstat(logPath)
+	check(logErr == nil && logInfo.Mode().IsRegular() && logInfo.Mode().Perm() == 0o600,
+		"diagnostic log permissions", "expected a regular 0600 file at "+logPath)
 	sshReport, sshErr := system.InspectSSHConfig(
 		filepath.Join(env.Home, ".ssh", "config"),
 		env.Home,
