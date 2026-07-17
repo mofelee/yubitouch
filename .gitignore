@@ -1,0 +1,5 @@
+/bin/
+/dist/
+*.sock
+*.test
+.DS_Store
