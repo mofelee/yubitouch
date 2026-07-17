@@ -189,6 +189,8 @@ yubitouch about           显示项目身份及无关联声明
 - 公共 Agent 拒绝 Add、Remove、RemoveAll、Lock 和 Unlock。
 - 每个前端连接使用独立 backend Agent 连接；`session-bind@openssh.com` 上下文不会跨客户端共享。
 - 同一时间只有一个 PIV 签名进入 backend；错误 PIN 不自动重试。
+- 公共 Agent frame 在 payload 分配前限制为 1 MiB；`session-bind` 另限制为 16 条和累计 1 MiB。
+- backend 尚未建立时仅接受并缓存 `session-bind`；其他 extension 返回标准 unsupported，不触发 backend/PIN/UI。
 - PIN 不进入命令行参数、配置、普通环境变量、日志或状态文件。
 - 签名请求和签名结果不会写入日志、状态文件或 UI。
 - YubiTouch 不支持 Agent Forwarding，建议保持 `ForwardAgent no`。

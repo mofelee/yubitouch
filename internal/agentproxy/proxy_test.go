@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -223,6 +225,105 @@ func TestSessionBindRetentionIsBounded(t *testing.T) {
 	}
 	if _, err := a.Extension(sessionBindExtension, []byte("one too many")); err == nil {
 		t.Fatal("session-bind retention accepted too many entries")
+	}
+}
+
+func TestUnknownExtensionDoesNotCreateBackend(t *testing.T) {
+	target := newPublicKey(t)
+	backend := &fakeBackend{}
+	var factories atomic.Int32
+	a := &connectionAgent{
+		ctx:    context.Background(),
+		target: target,
+		backendFactory: func(context.Context) (Backend, error) {
+			factories.Add(1)
+			return backend, nil
+		},
+		coordinator: signing.New(nil, nil, time.Second),
+	}
+	if _, err := a.Extension("query@example.com", nil); !errors.Is(err, agent.ErrExtensionUnsupported) {
+		t.Fatalf("extension before sign error = %v", err)
+	}
+	if factories.Load() != 0 {
+		t.Fatal("extension created backend before signing")
+	}
+	if _, err := a.Sign(target, []byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Extension("query@example.com", nil); err != nil {
+		t.Fatal(err)
+	}
+	if factories.Load() != 1 || backend.extensions.Load() != 1 {
+		t.Fatalf("factories=%d extensions=%d", factories.Load(), backend.extensions.Load())
+	}
+}
+
+func TestOversizedAgentFrameIsRejectedBeforeBackendCreation(t *testing.T) {
+	target := newPublicKey(t)
+	var factories atomic.Int32
+	server := &Server{
+		TargetKey: target,
+		BackendFactory: func(context.Context) (Backend, error) {
+			factories.Add(1)
+			return &fakeBackend{}, nil
+		},
+		Coordinator: signing.New(nil, nil, time.Second),
+	}
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.serveConn(context.Background(), serverConn)
+		close(done)
+	}()
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], maxAgentRequestBytes+1)
+	if _, err := clientConn.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	var response [1]byte
+	if _, err := clientConn.Read(response[:]); err == nil {
+		t.Fatal("oversized request did not close the connection")
+	}
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agent server did not reject oversized request")
+	}
+	if factories.Load() != 0 {
+		t.Fatal("oversized request created a backend")
+	}
+}
+
+func TestBoundedAgentConnAcceptsCompleteFrames(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	bounded := &boundedAgentConn{Conn: serverConn}
+	payloads := [][]byte{{11}, {27, 0, 0, 0, 0}}
+	go func() {
+		for _, payload := range payloads {
+			var header [4]byte
+			binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+			_, _ = clientConn.Write(append(header[:], payload...))
+		}
+	}()
+	for _, want := range payloads {
+		var header [4]byte
+		if _, err := io.ReadFull(bounded, header[:]); err != nil {
+			t.Fatal(err)
+		}
+		if got := binary.BigEndian.Uint32(header[:]); got != uint32(len(want)) {
+			t.Fatalf("frame length = %d, want %d", got, len(want))
+		}
+		payload := make([]byte, len(want))
+		if _, err := io.ReadFull(bounded, payload); err != nil {
+			t.Fatal(err)
+		}
+		if !stringEqual(payload, want) {
+			t.Fatalf("payload = %v, want %v", payload, want)
+		}
 	}
 }
 

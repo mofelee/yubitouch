@@ -3,6 +3,7 @@ package agentproxy
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 var (
 	ErrKeyNotAllowed   = errors.New("agent: key is not exposed by YubiTouch")
 	ErrOperationDenied = errors.New("agent: operation is disabled by YubiTouch")
+	errRequestTooLarge = errors.New("agent: request exceeds YubiTouch size limit")
 )
 
 const sessionBindExtension = "session-bind@openssh.com"
@@ -26,6 +28,7 @@ const sessionBindExtension = "session-bind@openssh.com"
 const (
 	maxPendingSessionBinds = 16
 	maxPendingBytes        = 1 << 20
+	maxAgentRequestBytes   = 1 << 20
 )
 
 type Backend interface {
@@ -122,7 +125,37 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		coordinator:    s.Coordinator,
 	}
 	defer frontend.close()
-	_ = agent.ServeAgent(frontend, conn)
+	_ = agent.ServeAgent(frontend, &boundedAgentConn{Conn: conn})
+}
+
+type boundedAgentConn struct {
+	net.Conn
+	remaining uint32
+}
+
+func (c *boundedAgentConn) Read(p []byte) (int, error) {
+	if c.remaining == 0 {
+		if len(p) < 4 {
+			return 0, io.ErrShortBuffer
+		}
+		var header [4]byte
+		if _, err := io.ReadFull(c.Conn, header[:]); err != nil {
+			return 0, err
+		}
+		length := binary.BigEndian.Uint32(header[:])
+		if length > maxAgentRequestBytes {
+			return 0, errRequestTooLarge
+		}
+		copy(p, header[:])
+		c.remaining = length
+		return len(header), nil
+	}
+	if uint32(len(p)) > c.remaining {
+		p = p[:c.remaining]
+	}
+	n, err := c.Conn.Read(p)
+	c.remaining -= uint32(n)
+	return n, err
 }
 
 func watchDisconnect(ctx context.Context, conn net.Conn) {
@@ -255,9 +288,11 @@ func (a *connectionAgent) Extension(extensionType string, contents []byte) ([]by
 		}
 		return response, err
 	}
-	backend, err := a.getBackend()
-	if err != nil {
-		return nil, err
+	a.mu.Lock()
+	backend := a.backend
+	a.mu.Unlock()
+	if backend == nil {
+		return nil, agent.ErrExtensionUnsupported
 	}
 	return backend.Extension(extensionType, contents)
 }
@@ -268,15 +303,6 @@ func (a *connectionAgent) RemoveAll() error               { return ErrOperationD
 func (a *connectionAgent) Lock([]byte) error              { return ErrOperationDenied }
 func (a *connectionAgent) Unlock([]byte) error            { return ErrOperationDenied }
 func (a *connectionAgent) Signers() ([]ssh.Signer, error) { return nil, ErrOperationDenied }
-
-func (a *connectionAgent) getBackend() (Backend, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.backend != nil {
-		return a.backend, nil
-	}
-	return a.connectBackendLocked()
-}
 
 func (a *connectionAgent) getSigningBackend() (Backend, error) {
 	a.mu.Lock()
