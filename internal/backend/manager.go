@@ -76,7 +76,7 @@ func (m *Manager) EnsureAgent(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.Command(m.deps.SSHAgent, "-D", "-a", m.cfg.BackendSocketPath)
+	cmd := exec.Command(m.deps.SSHAgent, m.agentArguments()...)
 	cmd.Env = m.processEnv
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
@@ -115,6 +115,14 @@ func (m *Manager) EnsureAgent(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (m *Manager) agentArguments() []string {
+	args := []string{"-D", "-a", m.cfg.BackendSocketPath}
+	if strings.TrimSpace(m.deps.YKCS11) != "" {
+		args = append(args, "-P", m.deps.YKCS11)
+	}
+	return args
 }
 
 func (m *Manager) discardUnavailableAgentLocked(ctx context.Context) error {

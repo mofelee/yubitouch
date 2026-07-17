@@ -62,6 +62,38 @@ func TestManagerStartsConnectsAndStopsAgent(t *testing.T) {
 	}
 }
 
+func TestAgentArgumentsAllowOnlyConfiguredYKCS11Provider(t *testing.T) {
+	manager := New(
+		config.Config{BackendSocketPath: "/tmp/yubitouch-backend.sock"},
+		system.Dependencies{YKCS11: "/opt/homebrew/Cellar/yubico-piv-tool/2.7.3/lib/libykcs11.2.7.3.dylib"},
+		"/bin/false",
+		"/tmp/yubitouch-config.json",
+	)
+	want := []string{
+		"-D",
+		"-a", "/tmp/yubitouch-backend.sock",
+		"-P", "/opt/homebrew/Cellar/yubico-piv-tool/2.7.3/lib/libykcs11.2.7.3.dylib",
+	}
+	got := manager.agentArguments()
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("agent arguments = %q, want %q", got, want)
+	}
+}
+
+func TestAgentArgumentsOmitEmptyProviderAllowlist(t *testing.T) {
+	manager := New(
+		config.Config{BackendSocketPath: "/tmp/yubitouch-backend.sock"},
+		system.Dependencies{},
+		"/bin/false",
+		"/tmp/yubitouch-config.json",
+	)
+	want := []string{"-D", "-a", "/tmp/yubitouch-backend.sock"}
+	got := manager.agentArguments()
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("agent arguments = %q, want %q", got, want)
+	}
+}
+
 func TestManagerRestartsCrashedAgentAndMissingSocket(t *testing.T) {
 	sshAgent, err := exec.LookPath("ssh-agent")
 	if err != nil {
