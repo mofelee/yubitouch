@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/config"
+	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/system"
 )
 
@@ -91,6 +92,49 @@ func TestAgentArgumentsOmitEmptyProviderAllowlist(t *testing.T) {
 	got := manager.agentArguments()
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("agent arguments = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeSignFailureDetectsRemovedYubiKey(t *testing.T) {
+	manager := New(config.Config{}, system.Dependencies{}, "/bin/false", "/tmp/yubitouch-config.json")
+	manager.probeKeys = func(context.Context) (int, error) { return 0, nil }
+	raw := errors.New("agent refused operation")
+	err := manager.NormalizeSignFailure(context.Background(), raw)
+	if !errors.Is(err, signing.ErrDeviceUnavailable) {
+		t.Fatalf("normalized error = %v, want device unavailable", err)
+	}
+}
+
+func TestNormalizeSignFailureRetriesTransientDeviceState(t *testing.T) {
+	manager := New(config.Config{}, system.Dependencies{}, "/bin/false", "/tmp/yubitouch-config.json")
+	probes := 0
+	manager.probeKeys = func(context.Context) (int, error) {
+		probes++
+		if probes == 1 {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	err := manager.NormalizeSignFailure(context.Background(), errors.New("agent refused operation"))
+	if !errors.Is(err, signing.ErrDeviceUnavailable) || probes != 2 {
+		t.Fatalf("normalized error = %v, probes = %d", err, probes)
+	}
+}
+
+func TestNormalizeSignFailurePreservesOtherFailures(t *testing.T) {
+	manager := New(config.Config{}, system.Dependencies{}, "/bin/false", "/tmp/yubitouch-config.json")
+	raw := errors.New("agent refused operation")
+	for _, probe := range []func(context.Context) (int, error){
+		func(context.Context) (int, error) { return 1, nil },
+		func(context.Context) (int, error) { return 0, system.ErrDeviceProbe },
+	} {
+		manager.probeKeys = probe
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		got := manager.NormalizeSignFailure(ctx, raw)
+		cancel()
+		if got != raw {
+			t.Fatalf("normalized error = %v, want original %v", got, raw)
+		}
 	}
 }
 

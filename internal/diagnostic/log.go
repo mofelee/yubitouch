@@ -273,6 +273,9 @@ func Classify(err error) FailureClass {
 	if errors.Is(err, signing.ErrCanceled) || errors.Is(err, context.Canceled) {
 		return FailureCanceled
 	}
+	if errors.Is(err, signing.ErrDeviceUnavailable) {
+		return FailureDeviceUnavailable
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(message, "configured target key") || strings.Contains(message, "key was not found"):

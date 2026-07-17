@@ -34,8 +34,15 @@ func (a *App) Handle(event signing.Event) {
 	case signing.EventCanceled:
 		macos.Hide(event.RequestID)
 	case signing.EventFailure:
-		macos.ShowFailure("签名失败，请检查 YubiKey 后重试", event.RequestID)
+		macos.ShowFailure(signFailureMessage(event.Err), event.RequestID)
 	}
+}
+
+func signFailureMessage(err error) string {
+	if errors.Is(err, signing.ErrDeviceUnavailable) {
+		return "YubiKey 已断开，请重新连接"
+	}
+	return "签名失败，请检查 YubiKey 后重试"
 }
 
 func (a *App) Run(ctx context.Context, serverResult <-chan error) error {

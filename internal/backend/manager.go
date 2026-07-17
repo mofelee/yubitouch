@@ -18,12 +18,15 @@ import (
 
 	"github.com/mofelee/yubitouch/internal/agentproxy"
 	"github.com/mofelee/yubitouch/internal/config"
+	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/system"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
 
 const backendStartTimeout = 3 * time.Second
+const deviceProbeTimeout = 3 * time.Second
+const deviceProbeInterval = 100 * time.Millisecond
 
 type Manager struct {
 	cfg        config.Config
@@ -31,6 +34,7 @@ type Manager struct {
 	executable string
 	configPath string
 	processEnv []string
+	probeKeys  func(context.Context) (int, error)
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
@@ -47,6 +51,7 @@ func New(cfg config.Config, deps system.Dependencies, executable string, configP
 		executable: executable,
 		configPath: configPath,
 		processEnv: sanitizedEnvironment(os.Environ()),
+		probeKeys:  system.ProbeYubiKeys,
 	}
 }
 
@@ -181,6 +186,24 @@ func (m *Manager) Invalidate() {
 	m.providerMu.Lock()
 	m.invalid = true
 	m.providerMu.Unlock()
+}
+
+func (m *Manager) NormalizeSignFailure(ctx context.Context, signErr error) error {
+	probeCtx, cancel := context.WithTimeout(ctx, deviceProbeTimeout)
+	defer cancel()
+	ticker := time.NewTicker(deviceProbeInterval)
+	defer ticker.Stop()
+	for {
+		count, err := m.probeKeys(probeCtx)
+		if err == nil && count == 0 {
+			return fmt.Errorf("%w: %v", signing.ErrDeviceUnavailable, signErr)
+		}
+		select {
+		case <-probeCtx.Done():
+			return signErr
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *Manager) Stop(ctx context.Context) error {

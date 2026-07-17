@@ -16,6 +16,15 @@ type eventRecorder struct {
 	events []Event
 }
 
+type normalizingInitializer struct {
+	normalized error
+}
+
+func (n normalizingInitializer) Ensure(context.Context) error { return nil }
+func (n normalizingInitializer) NormalizeSignFailure(context.Context, error) error {
+	return n.normalized
+}
+
 func (r *eventRecorder) Handle(event Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -85,6 +94,21 @@ func TestCoordinatorPublishesLifecycle(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("events = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestCoordinatorPublishesNormalizedSignFailure(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(normalizingInitializer{normalized: ErrDeviceUnavailable}, recorder, time.Second)
+	_, err := coordinator.Sign(context.Background(), func() (*ssh.Signature, error) {
+		return nil, errors.New("opaque agent failure")
+	})
+	if !errors.Is(err, ErrDeviceUnavailable) {
+		t.Fatalf("error = %v, want device unavailable", err)
+	}
+	event := coordinator.LastEvent()
+	if event.Type != EventFailure || !errors.Is(event.Err, ErrDeviceUnavailable) {
+		t.Fatalf("last event = %+v", event)
 	}
 }
 

@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	ErrCanceled = errors.New("sign request canceled")
-	ErrTimeout  = errors.New("sign request timed out")
+	ErrCanceled          = errors.New("sign request canceled")
+	ErrTimeout           = errors.New("sign request timed out")
+	ErrDeviceUnavailable = errors.New("YubiKey became unavailable during signing")
 )
 
 type EventType string
@@ -42,6 +43,10 @@ type Initializer interface {
 
 type Invalidator interface {
 	Invalidate()
+}
+
+type SignFailureNormalizer interface {
+	NormalizeSignFailure(context.Context, error) error
 }
 
 type InitializerFunc func(context.Context) error
@@ -133,6 +138,9 @@ func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Sign
 		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID})
 		sig, err := call()
 		if err != nil {
+			if normalizer, ok := c.initializer.(SignFailureNormalizer); ok {
+				err = normalizer.NormalizeSignFailure(requestCtx, err)
+			}
 			if invalidator, ok := c.initializer.(Invalidator); ok {
 				invalidator.Invalidate()
 			}

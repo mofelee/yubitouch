@@ -2,10 +2,22 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mofelee/yubitouch/internal/signing"
 )
+
+func TestSignFailureMessageDistinguishesRemovedDevice(t *testing.T) {
+	if got := signFailureMessage(signing.ErrDeviceUnavailable); got != "YubiKey 已断开，请重新连接" {
+		t.Fatalf("device failure message = %q", got)
+	}
+	if got := signFailureMessage(errors.New("other failure")); got != "签名失败，请检查 YubiKey 后重试" {
+		t.Fatalf("generic failure message = %q", got)
+	}
+}
 
 func TestCancellationWatcherConsumesSignalOnce(t *testing.T) {
 	app := New("none")

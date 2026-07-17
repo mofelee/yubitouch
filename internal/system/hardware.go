@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -27,7 +28,19 @@ type HardwareReport struct {
 }
 
 func ProbeYubiKeys(ctx context.Context) (int, error) {
-	return probeYubiKeys(ctx, exec.LookPath, commandOutput)
+	return probeYubiKeys(ctx, lookupYKMan, commandOutput)
+}
+
+func lookupYKMan(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	for _, path := range []string{"/opt/homebrew/bin/ykman", "/usr/local/bin/ykman"} {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, nil
+		}
+	}
+	return "", ErrYKManUnavailable
 }
 
 type pathLookup func(string) (string, error)

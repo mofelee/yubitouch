@@ -2,6 +2,7 @@ package diagnostic
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +92,13 @@ func TestSigningSinkRecordsClassifiedCancellation(t *testing.T) {
 	contents := string(data)
 	if !strings.Contains(contents, `"event":"sign_canceled"`) || !strings.Contains(contents, `"failure_class":"canceled"`) {
 		t.Fatalf("cancellation was not classified: %s", contents)
+	}
+}
+
+func TestClassifyTypedDeviceUnavailable(t *testing.T) {
+	err := fmt.Errorf("sign failed: %w", signing.ErrDeviceUnavailable)
+	if got := Classify(err); got != FailureDeviceUnavailable {
+		t.Fatalf("failure class = %q, want %q", got, FailureDeviceUnavailable)
 	}
 }
 
