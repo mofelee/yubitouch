@@ -170,6 +170,10 @@ yubitouch about           显示项目身份及无关联声明
 设备状态为 `connected`、`not_detected` 或 `probe_unavailable`；该探测不会加载 YKCS11、
 读取 PIN 或显示触摸提示。
 
+`test-sign` 在 Agent 协议返回通用失败时，只读取 daemon 同步写入 `state.json` 的预定义
+失败分类。设备不可用、PIN/provider 初始化、目标 key 不匹配、超时或取消分别映射到
+退出码 `3`、`4`、`5`、`6`；未知分类返回 `1`。底层错误文本和被篡改的分类不会回显。
+
 退出码：`0` 成功，`1` 运行错误，`2` 配置错误，`3` 设备不可用，`4` PIN provider
 失败或取消，`5` 目标公钥不匹配，`6` 签名超时或取消。
 

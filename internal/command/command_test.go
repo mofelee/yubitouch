@@ -9,6 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mofelee/yubitouch/internal/signing"
+	"github.com/mofelee/yubitouch/internal/state"
 )
 
 const testPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG2Lg3xFnLvrY1W8yZOQ1q0+toWPZyV4lX5JUKbVwS3p test\n"
@@ -75,6 +79,59 @@ func TestYubiKeyStateDistinguishesMissingFromProbeFailure(t *testing.T) {
 	state, count = yubiKeyState(2, errors.New("probe failed"))
 	if state != "probe_unavailable" || count != 0 {
 		t.Fatalf("failed state = %q, %d", state, count)
+	}
+}
+
+func TestReportSignFailureMapsSafeExitCodes(t *testing.T) {
+	tests := []struct {
+		failure string
+		code    int
+		message string
+	}{
+		{failure: "device_unavailable", code: ExitDeviceMissing, message: "reconnect"},
+		{failure: "provider_initialization", code: ExitPINFailure, message: "PIN/provider"},
+		{failure: "key_mismatch", code: ExitKeyMismatch, message: "does not match"},
+		{failure: "timeout", code: ExitSignTimeout, message: "timed out"},
+		{failure: "canceled", code: ExitSignTimeout, message: "canceled"},
+		{failure: "op://Personal/YubiKey/PIN=123456", code: ExitRuntimeError, message: "yubitouch.log"},
+	}
+	for _, test := range tests {
+		t.Run(test.failure, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := reportSignFailure(&stderr, test.failure, "/tmp/yubitouch/config.json")
+			if code != test.code || !strings.Contains(stderr.String(), test.message) {
+				t.Fatalf("code=%d stderr=%q", code, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "op://") || strings.Contains(stderr.String(), "123456") || strings.Contains(stderr.String(), "Personal") {
+				t.Fatalf("failure output leaked sensitive text: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestLastSignFailureClassRejectsStaleState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	store := state.NewStore(filepath.Join(dir, "state.json"))
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().UTC()
+	store.Handle(signing.Event{
+		Type: signing.EventFailure,
+		At:   since.Add(-time.Second),
+		Err:  errors.New("ssh-add failed"),
+	})
+	if got := lastSignFailureClass(configPath, since); got != "" {
+		t.Fatalf("stale failure class = %q", got)
+	}
+	store.Handle(signing.Event{
+		Type: signing.EventFailure,
+		At:   since.Add(time.Second),
+		Err:  errors.New("ssh-add failed"),
+	})
+	if got := lastSignFailureClass(configPath, since); got != "provider_initialization" {
+		t.Fatalf("recent failure class = %q", got)
 	}
 }
 

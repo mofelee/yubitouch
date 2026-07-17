@@ -23,6 +23,7 @@ import (
 	"github.com/mofelee/yubitouch/internal/daemon"
 	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/launchagent"
+	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/state"
 	"github.com/mofelee/yubitouch/internal/system"
 	"github.com/mofelee/yubitouch/native/macos"
@@ -378,6 +379,13 @@ func runTestSign(stdout io.Writer, stderr io.Writer, env Environment) int {
 		fmt.Fprintf(stderr, "configuration error: %v\n", err)
 		return ExitConfigError
 	}
+	deviceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	deviceCount, deviceErr := env.ProbeYubiKeys(deviceCtx)
+	cancel()
+	if deviceErr == nil && deviceCount <= 0 {
+		fmt.Fprintln(stderr, "no YubiKey was detected; insert the device and retry yubitouch test-sign")
+		return ExitDeviceMissing
+	}
 	conn, err := net.DialTimeout("unix", cfg.SocketPath, time.Second)
 	if err != nil {
 		fmt.Fprintf(stderr, "public agent socket is unavailable: %v\n", err)
@@ -401,17 +409,53 @@ func runTestSign(stdout io.Writer, stderr io.Writer, env Environment) int {
 		return ExitRuntimeError
 	}
 	defer zeroBytes(payload)
+	signStartedAt := time.Now().UTC()
 	if _, err := client.Sign(cfg.PublicKey, payload); err != nil {
 		var netErr net.Error
 		if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-			fmt.Fprintln(stderr, "test signature timed out")
-			return ExitSignTimeout
+			return reportSignFailure(stderr, string(diagnostic.FailureTimeout), path)
 		}
-		fmt.Fprintf(stderr, "test signature failed: %v\n", err)
-		return ExitRuntimeError
+		return reportSignFailure(stderr, lastSignFailureClass(path, signStartedAt), path)
 	}
 	fmt.Fprintln(stdout, "Test signature succeeded. Signature data was not retained.")
 	return ExitOK
+}
+
+func lastSignFailureClass(configPath string, since time.Time) string {
+	persisted, err := state.Load(filepath.Join(filepath.Dir(configPath), "state.json"))
+	if err != nil {
+		return ""
+	}
+	if persisted.LastSignAt.Before(since) {
+		return ""
+	}
+	if persisted.LastSignEvent != string(signing.EventFailure) && persisted.LastSignEvent != string(signing.EventTimeout) {
+		return ""
+	}
+	return persisted.LastFailureClass
+}
+
+func reportSignFailure(stderr io.Writer, failureClass string, configPath string) int {
+	switch diagnostic.FailureClass(failureClass) {
+	case diagnostic.FailureDeviceUnavailable:
+		fmt.Fprintln(stderr, "YubiKey became unavailable; reconnect the device and retry yubitouch test-sign")
+		return ExitDeviceMissing
+	case diagnostic.FailureProviderInitialization:
+		fmt.Fprintln(stderr, "PIN/provider initialization failed; verify the configured PIN provider and YKCS11 setup, then retry once")
+		return ExitPINFailure
+	case diagnostic.FailureKeyMismatch:
+		fmt.Fprintln(stderr, "the loaded PIV 9A key does not match the configured public key; run yubitouch doctor")
+		return ExitKeyMismatch
+	case diagnostic.FailureTimeout:
+		fmt.Fprintln(stderr, "the signature request timed out; retry and touch the YubiKey when prompted")
+		return ExitSignTimeout
+	case diagnostic.FailureCanceled:
+		fmt.Fprintln(stderr, "the signature request was canceled; retry yubitouch test-sign")
+		return ExitSignTimeout
+	default:
+		fmt.Fprintf(stderr, "test signature failed; run yubitouch doctor and inspect %s\n", diagnostic.Path(configPath))
+		return ExitRuntimeError
+	}
 }
 
 func runAbout() int {

@@ -30,7 +30,7 @@ func TestStoreWritesOnlyClassifiedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ProviderState != "unavailable" || loaded.LastFailureClass != string(signing.EventFailure) {
+	if loaded.ProviderState != "unavailable" || loaded.LastFailureClass != "internal" {
 		t.Fatalf("state = %+v", loaded)
 	}
 	data, err := os.ReadFile(path)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/config"
+	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/signing"
 )
 
@@ -56,9 +57,16 @@ func (s *Store) Handle(event signing.Event) {
 		s.data.ProviderState = "initializing"
 	case signing.EventWaiting, signing.EventSuccess:
 		s.data.ProviderState = "loaded"
-	case signing.EventFailure, signing.EventTimeout:
+	case signing.EventFailure:
 		s.data.ProviderState = "unavailable"
-		s.data.LastFailureClass = string(event.Type)
+		failure := diagnostic.Classify(event.Err)
+		if failure == diagnostic.FailureNone {
+			failure = diagnostic.FailureInternal
+		}
+		s.data.LastFailureClass = string(failure)
+	case signing.EventTimeout:
+		s.data.ProviderState = "unavailable"
+		s.data.LastFailureClass = string(diagnostic.FailureTimeout)
 	}
 	_ = s.writeLocked()
 }
