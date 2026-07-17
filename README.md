@@ -63,6 +63,28 @@ ln -sfn /Applications/YubiTouch.app/Contents/MacOS/yubitouch ~/.local/bin/yubito
 
 正式发布还需要 Developer ID 签名和 notarization；当前构建脚本不会伪装已完成这些步骤。
 
+### Release candidate
+
+Release 构建必须在目标架构的原生 macOS runner 上完成，因为 Cocoa 和 1Password SDK 使用
+CGO。分别在 Apple Silicon (`arm64`) 和 Intel (`amd64`) runner 构建，不把单架构产物标记为
+universal。正式构建要求干净 worktree、`v<version>` tag、Developer ID 和 notarytool profile：
+
+```sh
+CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
+NOTARY_PROFILE='yubitouch-notary' \
+make release VERSION=0.1.0
+```
+
+输出目录为 `dist/release/<version>/<arch>/`，包含 `YubiTouch.app` zip、独立 CLI、
+`SHA256SUMS`、`release.json` 和 release notes。未签名、未打 tag 的本地候选只能显式运行：
+
+```sh
+ALLOW_DIRTY=1 ALLOW_UNTAGGED=1 ALLOW_UNSIGNED=1 make release VERSION=0.1.0
+```
+
+未签名候选会固定 app 文件时间并使用无额外 zip metadata 的排序归档，可用于复现性比较；
+Developer ID timestamp 和 notarization ticket 会使正式签名产物包含 Apple 服务生成的数据。
+
 ## 配置
 
 YubiTouch 将非敏感配置保存到 `~/.ssh/yubitouch/config.json`，文件权限为 `0600`，
