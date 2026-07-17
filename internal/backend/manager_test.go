@@ -111,6 +111,46 @@ func TestManagerRestartsCrashedAgentAndMissingSocket(t *testing.T) {
 	}
 }
 
+func TestNewManagerDoesNotTakeOverReachableAgent(t *testing.T) {
+	sshAgent, err := exec.LookPath("ssh-agent")
+	if err != nil {
+		t.Skip("ssh-agent is not installed")
+	}
+	dir, err := os.MkdirTemp("/tmp", "yt-backend-ownership-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg := config.Config{BackendSocketPath: filepath.Join(dir, "backend.sock")}
+	deps := system.Dependencies{SSHAgent: sshAgent}
+	owner := New(cfg, deps, "/bin/false", filepath.Join(dir, "config.json"))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = owner.Stop(ctx)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := owner.EnsureAgent(ctx); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	ownerPID := owner.cmd.Process.Pid
+
+	restartedDaemon := New(cfg, deps, "/bin/false", filepath.Join(dir, "config.json"))
+	err = restartedDaemon.EnsureAgent(ctx)
+	if err == nil || !strings.Contains(err.Error(), "unmanaged agent is already listening") {
+		t.Fatalf("new manager error = %v, want unmanaged agent refusal", err)
+	}
+	if owner.cmd.Process.Pid != ownerPID || !socketReachable(cfg.BackendSocketPath) {
+		t.Fatalf("owner agent was disturbed: pid=%d want=%d reachable=%v",
+			owner.cmd.Process.Pid, ownerPID, socketReachable(cfg.BackendSocketPath))
+	}
+}
+
 func waitForSocketState(t *testing.T, path string, reachable bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

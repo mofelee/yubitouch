@@ -18,9 +18,15 @@ import (
 )
 
 type Options struct {
-	ConfigPath string
-	Home       string
-	Executable string
+	ConfigPath  string
+	Home        string
+	Executable  string
+	Application Application
+}
+
+type Application interface {
+	signing.Sink
+	Run(context.Context, <-chan error) error
 }
 
 func Run(ctx context.Context, options Options) error {
@@ -62,7 +68,10 @@ func Run(ctx context.Context, options Options) error {
 	defer listener.Close()
 	_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventProxyListening, diagnostic.FailureNone)
 
-	app := ui.New(cfg.Sound)
+	app := options.Application
+	if app == nil {
+		app = ui.New(cfg.Sound)
+	}
 	coordinator := signing.New(manager, ui.MultiSink{store, app, diagnostic.NewSigningSink(logger)}, cfg.SignTimeout.Duration)
 	server := &agentproxy.Server{
 		TargetKey:      cfg.PublicKey,
