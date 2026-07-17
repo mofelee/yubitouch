@@ -115,8 +115,8 @@ type connectionAgent struct {
 
 	mu           sync.Mutex
 	backend      Backend
-	pending      []pendingExtension
-	pendingBytes int
+	bindings     []pendingExtension
+	bindingBytes int
 }
 
 type pendingExtension struct {
@@ -140,7 +140,7 @@ func (a *connectionAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	if !sameKey(a.target, key) {
 		return nil, ErrKeyNotAllowed
 	}
-	backend, err := a.getBackend()
+	backend, err := a.getSigningBackend()
 	if err != nil {
 		return nil, err
 	}
@@ -152,22 +152,27 @@ func (a *connectionAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 func (a *connectionAgent) Extension(extensionType string, contents []byte) ([]byte, error) {
 	if extensionType == sessionBindExtension {
 		a.mu.Lock()
+		defer a.mu.Unlock()
+		if len(a.bindings) >= maxPendingSessionBinds || a.bindingBytes+len(contents) > maxPendingBytes {
+			return nil, errors.New("agent: too many pending session-bind extensions")
+		}
+		binding := pendingExtension{
+			typeName: extensionType,
+			contents: append([]byte(nil), contents...),
+		}
+		a.bindings = append(a.bindings, binding)
+		a.bindingBytes += len(binding.contents)
 		if a.backend == nil {
-			if len(a.pending) >= maxPendingSessionBinds || a.pendingBytes+len(contents) > maxPendingBytes {
-				a.mu.Unlock()
-				return nil, errors.New("agent: too many pending session-bind extensions")
-			}
-			a.pending = append(a.pending, pendingExtension{
-				typeName: extensionType,
-				contents: append([]byte(nil), contents...),
-			})
-			a.pendingBytes += len(contents)
-			a.mu.Unlock()
 			return []byte{6}, nil
 		}
-		backend := a.backend
-		a.mu.Unlock()
-		return backend.Extension(extensionType, contents)
+		response, err := a.backend.Extension(extensionType, contents)
+		if err != nil {
+			last := len(a.bindings) - 1
+			a.bindingBytes -= len(a.bindings[last].contents)
+			zero(a.bindings[last].contents)
+			a.bindings = a.bindings[:last]
+		}
+		return response, err
 	}
 	backend, err := a.getBackend()
 	if err != nil {
@@ -189,18 +194,33 @@ func (a *connectionAgent) getBackend() (Backend, error) {
 	if a.backend != nil {
 		return a.backend, nil
 	}
+	return a.connectBackendLocked()
+}
+
+func (a *connectionAgent) getSigningBackend() (Backend, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.backend != nil {
+		if _, err := a.backend.List(); err == nil {
+			return a.backend, nil
+		}
+		_ = a.backend.Close()
+		a.backend = nil
+	}
+	return a.connectBackendLocked()
+}
+
+func (a *connectionAgent) connectBackendLocked() (Backend, error) {
 	backend, err := a.backendFactory(a.ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, extension := range a.pending {
+	for _, extension := range a.bindings {
 		if _, err := backend.Extension(extension.typeName, extension.contents); err != nil {
 			_ = backend.Close()
 			return nil, err
 		}
 	}
-	a.pending = nil
-	a.pendingBytes = 0
 	a.backend = backend
 	return backend, nil
 }
@@ -211,6 +231,17 @@ func (a *connectionAgent) close() {
 	if a.backend != nil {
 		_ = a.backend.Close()
 		a.backend = nil
+	}
+	for _, binding := range a.bindings {
+		zero(binding.contents)
+	}
+	a.bindings = nil
+	a.bindingBytes = 0
+}
+
+func zero(value []byte) {
+	for i := range value {
+		value[i] = 0
 	}
 }
 

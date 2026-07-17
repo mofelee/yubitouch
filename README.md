@@ -196,6 +196,16 @@ yubitouch about           显示项目身份及无关联声明
 YubiTouch 不能防御已经完全控制当前 macOS 用户或 root 的恶意软件，也不能消除用户触摸
 期间同权限恶意进程抢用 Agent 的风险。
 
+## 故障恢复
+
+受管 `ssh-agent` 异常退出或 backend socket 消失时，下一次签名会在同一次健康检查中重启
+YubiTouch 自己持有进程句柄的 agent。已经连接的前端客户端会在签名前通过只读 identity
+查询检测失效连接，重建独立 backend 连接，并重放该客户端的 `session-bind@openssh.com`
+上下文。绑定数据只保存在内存中，限制为 16 条和 1 MiB，并在连接关闭时尽力清零。
+
+YubiTouch 不自动重试已经发给 backend 的签名，因为响应丢失时无法证明签名没有成功；
+这样可以避免重复签名和错误 PIN 重试。无法验证为当前 Manager 启动的进程不会被终止。
+
 ## 开发验证
 
 自动化测试覆盖配置权限、禁止 PIN 字段、Agent key 过滤、受限操作、SignWithFlags、

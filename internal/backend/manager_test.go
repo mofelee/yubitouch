@@ -60,6 +60,68 @@ func TestManagerStartsConnectsAndStopsAgent(t *testing.T) {
 	}
 }
 
+func TestManagerRestartsCrashedAgentAndMissingSocket(t *testing.T) {
+	sshAgent, err := exec.LookPath("ssh-agent")
+	if err != nil {
+		t.Skip("ssh-agent is not installed")
+	}
+	dir, err := os.MkdirTemp("/tmp", "yt-backend-recovery-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg := config.Config{BackendSocketPath: filepath.Join(dir, "backend.sock")}
+	manager := New(cfg, system.Dependencies{SSHAgent: sshAgent}, "/bin/false", filepath.Join(dir, "config.json"))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = manager.Stop(ctx)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := manager.EnsureAgent(ctx); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	firstPID := manager.cmd.Process.Pid
+	if err := manager.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	waitForSocketState(t, cfg.BackendSocketPath, false)
+	if err := manager.EnsureAgent(ctx); err != nil {
+		t.Fatalf("restart crashed agent: %v", err)
+	}
+	secondPID := manager.cmd.Process.Pid
+	if secondPID == firstPID {
+		t.Fatalf("agent PID did not change after crash: %d", firstPID)
+	}
+
+	if err := os.Remove(cfg.BackendSocketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnsureAgent(ctx); err != nil {
+		t.Fatalf("recover missing socket: %v", err)
+	}
+	thirdPID := manager.cmd.Process.Pid
+	if thirdPID == secondPID || !socketReachable(cfg.BackendSocketPath) {
+		t.Fatalf("missing socket was not recovered: second=%d third=%d", secondPID, thirdPID)
+	}
+}
+
+func waitForSocketState(t *testing.T, path string, reachable bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for socketReachable(path) != reachable {
+		if time.Now().After(deadline) {
+			t.Fatalf("socket reachable=%v, want %v", socketReachable(path), reachable)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestSanitizedEnvironment(t *testing.T) {
 	got := sanitizedEnvironment([]string{
 		"PATH=/bin",

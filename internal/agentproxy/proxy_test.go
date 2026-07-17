@@ -20,12 +20,18 @@ import (
 )
 
 type fakeBackend struct {
-	signCount  atomic.Int32
-	closed     atomic.Bool
-	extensions atomic.Int32
+	signCount   atomic.Int32
+	closed      atomic.Bool
+	extensions  atomic.Int32
+	listFailure atomic.Bool
 }
 
-func (b *fakeBackend) List() ([]*agent.Key, error) { return nil, nil }
+func (b *fakeBackend) List() ([]*agent.Key, error) {
+	if b.listFailure.Load() {
+		return nil, errors.New("backend connection is stale")
+	}
+	return nil, nil
+}
 func (b *fakeBackend) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	return b.SignWithFlags(key, data, 0)
 }
@@ -134,6 +140,54 @@ func TestSessionBindIsReplayedWithoutEagerBackend(t *testing.T) {
 	}
 	if factories.Load() != 1 || backend.extensions.Load() != 1 {
 		t.Fatalf("factory=%d extension=%d", factories.Load(), backend.extensions.Load())
+	}
+}
+
+func TestStaleBackendReconnectsAndReplaysSessionBind(t *testing.T) {
+	target := newPublicKey(t)
+	first := &fakeBackend{}
+	second := &fakeBackend{}
+	backends := []*fakeBackend{first, second}
+	var factories atomic.Int32
+	a := &connectionAgent{
+		ctx:    context.Background(),
+		target: target,
+		backendFactory: func(context.Context) (Backend, error) {
+			index := int(factories.Add(1)) - 1
+			return backends[index], nil
+		},
+		coordinator: signing.New(nil, nil, time.Second),
+	}
+	if _, err := a.Sign(target, []byte("first request")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Extension(sessionBindExtension, []byte("binding")); err != nil {
+		t.Fatal(err)
+	}
+	first.listFailure.Store(true)
+	if _, err := a.Sign(target, []byte("second request")); err != nil {
+		t.Fatal(err)
+	}
+	if factories.Load() != 2 || !first.closed.Load() || second.extensions.Load() != 1 || second.signCount.Load() != 1 {
+		t.Fatalf("factories=%d first_closed=%v second_extensions=%d second_signs=%d",
+			factories.Load(), first.closed.Load(), second.extensions.Load(), second.signCount.Load())
+	}
+}
+
+func TestSessionBindRetentionIsBounded(t *testing.T) {
+	a := &connectionAgent{
+		ctx:            context.Background(),
+		target:         newPublicKey(t),
+		backendFactory: func(context.Context) (Backend, error) { return &fakeBackend{}, nil },
+		coordinator:    signing.New(nil, nil, time.Second),
+	}
+	for range maxPendingSessionBinds {
+		if _, err := a.Extension(sessionBindExtension, []byte("binding")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := a.Extension(sessionBindExtension, []byte("one too many")); err == nil {
+		t.Fatal("session-bind retention accepted too many entries")
 	}
 }
 

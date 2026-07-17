@@ -67,13 +67,8 @@ func (m *Manager) EnsureAgent(ctx context.Context) error {
 		if socketReachable(m.cfg.BackendSocketPath) {
 			return nil
 		}
-		select {
-		case err := <-m.waitDone:
-			m.cmd = nil
-			m.waitDone = nil
-			return fmt.Errorf("managed ssh-agent exited: %w", err)
-		default:
-			return errors.New("managed ssh-agent is running but its socket is unavailable")
+		if err := m.discardUnavailableAgentLocked(ctx); err != nil {
+			return err
 		}
 	}
 	if err := prepareSocketPath(m.cfg.BackendSocketPath); err != nil {
@@ -118,6 +113,30 @@ func (m *Manager) EnsureAgent(ctx context.Context) error {
 			return errors.New("timed out waiting for the backend ssh-agent socket")
 		case <-ticker.C:
 		}
+	}
+}
+
+func (m *Manager) discardUnavailableAgentLocked(ctx context.Context) error {
+	if m.cmd == nil {
+		return nil
+	}
+	select {
+	case <-m.waitDone:
+		m.cmd = nil
+		m.waitDone = nil
+		return nil
+	default:
+	}
+	if m.cmd.Process != nil {
+		_ = m.cmd.Process.Kill()
+	}
+	select {
+	case <-m.waitDone:
+		m.cmd = nil
+		m.waitDone = nil
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
