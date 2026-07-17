@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/agentproxy"
@@ -224,6 +225,7 @@ func (m *Manager) loadProvider(ctx context.Context) error {
 	defer os.Remove(guard)
 
 	cmd := exec.CommandContext(ctx, m.deps.SSHAdd, "-s", provider)
+	configureProcessGroupCancellation(cmd)
 	cmd.Env = append(append([]string{}, m.processEnv...),
 		"SSH_AUTH_SOCK="+m.cfg.BackendSocketPath,
 		"SSH_ASKPASS_REQUIRE=force",
@@ -242,6 +244,20 @@ func (m *Manager) loadProvider(ctx context.Context) error {
 	}
 	m.deps.YKCS11 = provider
 	return nil
+}
+
+func configureProcessGroupCancellation(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
 }
 
 func (m *Manager) unloadProvider(ctx context.Context) error {

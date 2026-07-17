@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -149,6 +151,61 @@ func TestNewManagerDoesNotTakeOverReachableAgent(t *testing.T) {
 		t.Fatalf("owner agent was disturbed: pid=%d want=%d reachable=%v",
 			owner.cmd.Process.Pid, ownerPID, socketReachable(cfg.BackendSocketPath))
 	}
+}
+
+func TestLoadProviderCancellationStopsAskPassProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	provider := filepath.Join(dir, "libykcs11.dylib")
+	if err := os.WriteFile(provider, []byte("test provider"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sshAdd := filepath.Join(dir, "ssh-add")
+	script := "#!/bin/sh\n" +
+		"sleep 30 &\n" +
+		"child=$!\n" +
+		"printf '%s\\n' \"$child\" > \"$YUBITOUCH_TEST_CHILD_PID\"\n" +
+		"wait \"$child\"\n"
+	if err := os.WriteFile(sshAdd, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	childPIDPath := filepath.Join(dir, "child.pid")
+	cfg := config.Config{
+		YKCS11Path:        provider,
+		BackendSocketPath: filepath.Join(dir, "backend.sock"),
+	}
+	manager := New(cfg, system.Dependencies{SSHAdd: sshAdd}, "/bin/false", filepath.Join(dir, "config.json"))
+	manager.processEnv = []string{
+		"PATH=/usr/bin:/bin",
+		"YUBITOUCH_TEST_CHILD_PID=" + childPIDPath,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := manager.loadProvider(ctx); err == nil {
+		t.Fatal("loadProvider succeeded after its context expired")
+	}
+	data, err := os.ReadFile(childPIDPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	deadline := time.Now().Add(3 * time.Second)
+	for processRunning(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processRunning(childPID) {
+		t.Fatalf("AskPass child process %d survived provider cancellation", childPID)
+	}
+}
+
+func processRunning(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func waitForSocketState(t *testing.T, path string, reachable bool) {
