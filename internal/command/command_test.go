@@ -135,6 +135,39 @@ func TestLastSignFailureClassRejectsStaleState(t *testing.T) {
 	}
 }
 
+func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
+	signAt := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	persisted := state.State{
+		PID:           4242,
+		ProviderState: "loaded",
+		LastSignEvent: "success",
+		LastSignAt:    signAt,
+	}
+	stale := Status{ProviderState: "not_loaded"}
+	mergePersistedState(&stale, persisted, false)
+	if !stale.StateStale || stale.DaemonPID != 0 || stale.ProviderState != "unavailable" {
+		t.Fatalf("stale status = %+v", stale)
+	}
+	if stale.LastSignEvent != "success" || stale.LastSignAt != signAt.Format(time.RFC3339) {
+		t.Fatalf("stale history was not retained: %+v", stale)
+	}
+
+	current := Status{ProviderState: "not_loaded"}
+	mergePersistedState(&current, persisted, true)
+	if current.StateStale || current.DaemonPID != 4242 || current.ProviderState != "loaded" {
+		t.Fatalf("current status = %+v", current)
+	}
+}
+
+func TestProcessAliveRecognizesCurrentProcess(t *testing.T) {
+	if !processAlive(os.Getpid()) {
+		t.Fatal("current process was reported dead")
+	}
+	if processAlive(-1) {
+		t.Fatal("invalid process was reported alive")
+	}
+}
+
 func TestMissingConfigIsConfigError(t *testing.T) {
 	env := Environment{Home: t.TempDir(), Getenv: func(string) string { return "" }}
 	var stdout, stderr bytes.Buffer

@@ -131,6 +131,7 @@ type Status struct {
 	LogSizeBytes      int64  `json:"log_size_bytes,omitempty"`
 	YubiKeyState      string `json:"yubikey_state"`
 	YubiKeyCount      int    `json:"yubikey_count"`
+	StateStale        bool   `json:"state_stale"`
 }
 
 func runConfigure(stdout io.Writer, stderr io.Writer, env Environment) int {
@@ -195,12 +196,8 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 		status.ProviderState = "unknown"
 	}
 	if persisted, err := state.Load(filepath.Join(filepath.Dir(path), "state.json")); err == nil {
-		status.DaemonPID = persisted.PID
-		status.ProviderState = persisted.ProviderState
-		status.LastSignEvent = persisted.LastSignEvent
-		if !persisted.LastSignAt.IsZero() {
-			status.LastSignAt = persisted.LastSignAt.Format(time.RFC3339)
-		}
+		current := status.AgentReachable && processAlive(persisted.PID)
+		mergePersistedState(&status, persisted, current)
 	}
 
 	if jsonOutput {
@@ -215,6 +212,9 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	fmt.Fprintf(stdout, "LaunchAgent: %s\n", availability(status.LaunchAgentLoaded))
 	fmt.Fprintf(stdout, "Backend socket: %s\n", availability(status.BackendReachable))
 	fmt.Fprintf(stdout, "Provider: %s\n", status.ProviderState)
+	if status.StateStale {
+		fmt.Fprintln(stdout, "State file: stale (daemon PID or public socket is unavailable)")
+	}
 	fmt.Fprintf(stdout, "PIN provider: %s\n", status.PINProvider)
 	fmt.Fprintf(stdout, "Public key: %s\n", status.PublicKey)
 	fmt.Fprintf(stdout, "YubiKey: %s", status.YubiKeyState)
@@ -540,6 +540,29 @@ func yubiKeyState(count int, err error) (string, int) {
 		return yubiKeyNotDetected, 0
 	}
 	return yubiKeyConnected, count
+}
+
+func mergePersistedState(status *Status, persisted state.State, current bool) {
+	status.LastSignEvent = persisted.LastSignEvent
+	if !persisted.LastSignAt.IsZero() {
+		status.LastSignAt = persisted.LastSignAt.Format(time.RFC3339)
+	}
+	if !current {
+		status.StateStale = true
+		status.ProviderState = "unavailable"
+		status.DaemonPID = 0
+		return
+	}
+	status.DaemonPID = persisted.PID
+	status.ProviderState = persisted.ProviderState
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func writeJSON(w io.Writer, value any) error {
