@@ -56,8 +56,9 @@ make app
 入口并注册 LaunchAgent；移动已经注册的二进制会使 launchd 路径失效。
 
 ```sh
+ditto dist/YubiTouch.app /Applications/YubiTouch.app
 mkdir -p ~/.local/bin
-ln -s /Applications/YubiTouch.app/Contents/MacOS/yubitouch ~/.local/bin/yubitouch
+ln -sfn /Applications/YubiTouch.app/Contents/MacOS/yubitouch ~/.local/bin/yubitouch
 ```
 
 正式发布还需要 Developer ID 签名和 notarization；当前构建脚本不会伪装已完成这些步骤。
@@ -67,8 +68,25 @@ ln -s /Applications/YubiTouch.app/Contents/MacOS/yubitouch ~/.local/bin/yubitouc
 YubiTouch 将非敏感配置保存到 `~/.ssh/yubitouch/config.json`，文件权限为 `0600`，
 目录权限为 `0700`。配置 schema 没有 PIN 字段；设置 `YUBITOUCH_PIN` 会被明确拒绝。
 
-准备一个只包含 PIV 9A 身份公钥的 OpenSSH 公钥文件。不要使用 YKCS11 返回的 RSA
-PIV Attestation key。
+### 准备 PIV 9A 公钥
+
+先确认 9A 槽位算法与触摸策略，再通过项目实际使用的 YKCS11 provider 枚举公钥：
+
+```sh
+ykman piv keys info 9a
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+"$(brew --prefix openssh)/bin/ssh-keygen" -D "$(brew --prefix yubico-piv-tool)/lib/libykcs11.dylib"
+"$(brew --prefix openssh)/bin/ssh-keygen" -D "$(brew --prefix yubico-piv-tool)/lib/libykcs11.dylib" | awk '$1 == "ssh-ed25519"' > ~/.ssh/yubikey-piv.pub
+test "$(wc -l < ~/.ssh/yubikey-piv.pub)" -eq 1
+chmod 644 ~/.ssh/yubikey-piv.pub
+```
+
+YubiTouch v0.1 要求该文件是 `ssh-ed25519` PIV 9A 公钥。不要使用 YKCS11 返回的 RSA
+PIV Attestation key。第一条 `ssh-keygen -D` 命令应显示 9A 的 `PIV Authentication` 注释；
+如果设备还有其他 ED25519 PIV key，停止并人工选择 9A 对应行，不要使用自动过滤结果。
+`configure` 会拒绝其他算法或多行文件，`doctor` 会确认配置公钥出现在 provider 输出中并
+报告被过滤的其他 key 数量。
 
 ### 手动 PIN
 
@@ -77,6 +95,7 @@ export YUBITOUCH_PIN_PROVIDER=prompt
 export YUBITOUCH_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub"
 yubitouch configure
 yubitouch ensure
+yubitouch test-sign
 ```
 
 第一次真实签名时显示 `NSSecureTextField` 对话框。图形会话不可用时尝试从当前 TTY
@@ -91,12 +110,14 @@ export YUBITOUCH_1PASSWORD_REF='op://Personal/YubiKey PIV/pin'
 export YUBITOUCH_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub"
 yubitouch configure
 yubitouch ensure
+yubitouch test-sign
 ```
 
 `YUBITOUCH_1PASSWORD_ACCOUNT` 可以是桌面应用显示的账户名或账户 UUID。v0.1 只支持
 Desktop App Integration，不使用 service account token。SDK 返回不可变 Go `string`，
 因此无法形式化保证原地清零；YubiTouch 把解析限制在一次性 AskPass helper 进程中，
-写入 OpenSSH AskPass 管道后立即退出。
+写入 OpenSSH AskPass 管道后立即退出。受 Go 垃圾回收、运行库复制和外部 SDK/OpenSSH
+行为影响，任何模式都无法形式化证明内存中不存在残留副本。
 
 在 1Password 模式下，`yubitouch doctor` 会本地校验 secret reference 语法，并初始化
 Desktop App Integration client 来验证账户和桌面集成；这可能触发 1Password 自己的授权
@@ -115,6 +136,28 @@ Desktop App Integration client 来验证账户和桌面集成；这可能触发 
 - `YUBITOUCH_LOG_LEVEL`
 
 修改环境变量后再次运行 `yubitouch configure`，然后运行 `yubitouch reload`。
+
+`configure` 时的优先级为：当前环境变量、已有配置文件、内置默认值。除内部 daemon 的
+`--config` 外，v0.1 没有配置字段的命令行覆盖。daemon 不读取交互式 shell 环境；它只读取
+`ensure` 注册时确定的 `0600` 配置文件。`YUBITOUCH_CONFIG` 只选择配置文件位置，不写入文件。
+
+| 配置字段 | 环境变量 | 默认值 |
+|---|---|---|
+| `pin_provider` | `YUBITOUCH_PIN_PROVIDER` | `prompt` |
+| `onepassword_account` | `YUBITOUCH_1PASSWORD_ACCOUNT` | 1Password 模式必填 |
+| `onepassword_ref` | `YUBITOUCH_1PASSWORD_REF` | 1Password 模式必填 `op://` reference |
+| `public_key` | `YUBITOUCH_PUBLIC_KEY` | 必填 |
+| `ykcs11` | `YUBITOUCH_YKCS11` | Homebrew `opt/yubico-piv-tool` 自动检测 |
+| `openssh_prefix` | `YUBITOUCH_OPENSSH_PREFIX` | Homebrew `opt/openssh` 自动检测 |
+| `socket` | `YUBITOUCH_SOCKET` | `~/.ssh/yubitouch/agent.sock` |
+| `backend_socket` | `YUBITOUCH_BACKEND_SOCKET` | `~/.ssh/yubitouch/backend.sock` |
+| `sound` | `YUBITOUCH_SOUND` | `Glass`；`none` 静音 |
+| `sign_timeout` | `YUBITOUCH_SIGN_TIMEOUT` | `60s` |
+| `log_level` | `YUBITOUCH_LOG_LEVEL` | `info` |
+
+`yubitouch ensure` 原子写入 `~/Library/LaunchAgents/com.github.mofelee.yubitouch.plist`，然后
+bootstrap 或 kickstart 当前 GUI 用户的 LaunchAgent。plist 使用 `RunAtLoad` 和 `KeepAlive`；
+登录启动、`ensure` 和 `reload` 都只恢复 daemon/公共 socket，不加载 provider。
 
 ## 诊断日志
 
@@ -157,6 +200,20 @@ Host production-* bastion
 读取 SSH config 的第三方程序可直接使用同一 socket。`ssh -G`、密钥列表查询以及没有
 新签名的 ControlMaster 复用不会请求 PIN 或显示触摸提示。
 
+### DebianForm
+
+DebianForm 无需 YubiTouch wrapper 或专用集成。让它继续使用系统 SSH 配置，并让目标 Host
+匹配上面的 `IdentityAgent`、`IdentityFile` 和 `IdentitiesOnly` 即可。DebianForm 发起新的
+SSH 签名时会出现触摸提示；复用已有连接而没有新签名时不显示提示是预期行为。
+
+完成本地验证后可直接测试配置与登录：
+
+```sh
+yubitouch doctor
+ssh -G example-yubikey >/dev/null
+ssh example-yubikey
+```
+
 ## 命令
 
 ```text
@@ -169,6 +226,7 @@ yubitouch stop            停止当前用户的 LaunchAgent
 yubitouch doctor          检查依赖、权限、socket 和配置
 yubitouch test-sign       显式运行 PIN、触摸和签名全链路
 yubitouch about           显示项目身份及无关联声明
+yubitouch version         显示版本和提交信息
 ```
 
 `status` 只通过 `ykman list --serials` 探测设备，并且只输出设备数量，不返回序列号。
@@ -181,6 +239,24 @@ yubitouch about           显示项目身份及无关联声明
 
 退出码：`0` 成功，`1` 运行错误，`2` 配置错误，`3` 设备不可用，`4` PIN provider
 失败或取消，`5` 目标公钥不匹配，`6` 签名超时或取消。
+
+## 故障排查
+
+| 现象 | 检查与处理 |
+|---|---|
+| `not configured` | 设置必要环境变量并重新运行 `yubitouch configure`。 |
+| 公共 Agent socket 不可达 | 运行 `yubitouch ensure`，再检查 `yubitouch status` 与诊断日志。 |
+| `doctor` 报告 YubiKey 不可用 | 重新插入设备，确认 `ykman list` 可见后重试。 |
+| PIV 9A key 不匹配 | 重新执行 9A 公钥导出；不要选择 RSA Attestation key。 |
+| prompt PIN 被取消或不可显示 | 在 Aqua 图形会话重试；TTY fallback 也不可用时不会后台等待。 |
+| 1Password 初始化失败 | 解锁桌面应用，启用 Integrate with other apps，检查 account/reference 后重新 `configure`。 |
+| 签名超时 | 保持设备连接，在提示出现后触摸；YubiTouch 不会自动重试该请求。 |
+| 配置或路径修改后行为未变化 | 重新 `configure`，再运行 `yubitouch reload`。 |
+| stale socket/backend 错误 | 先 `yubitouch stop`，确认受管服务停止后再 `yubitouch ensure`；不要手工杀死未知 agent。 |
+
+`status --json` 适合采集脱敏状态，`doctor` 适合检查依赖与配置，`test-sign` 是唯一显式运行
+完整 PIN/provider/touch 链路的诊断命令。错误详情按预定义分类记录在
+`~/.ssh/yubitouch/yubitouch.log`，不应通过开启日志来寻找 PIN 或签名内容。
 
 ## 安全边界
 
@@ -230,5 +306,9 @@ plist 和脱敏状态。子进程崩溃测试还覆盖公共 socket 恢复、无
 状态 PID 更新；跨 Manager 测试覆盖可达 backend 的归属边界。真实 Unix socket 与 ssh-agent
 生命周期测试在受限沙箱外运行。
 
-发布前还必须在真实 YubiKey 上完成：PIV 9A/Attestation 过滤、错误 PIN 尝试次数、设备
-拔插、Touch ID、OpenSSH 版本矩阵、DebianForm、全屏 Space、代码签名和 notarization。
+真实硬件、LaunchAgent、OpenSSH/ykcs11 版本、ControlMaster 和 DebianForm 的验证步骤与
+记录模板见 [`docs/verification.md`](docs/verification.md)。更新矩阵时必须记录版本和结果，
+不得附加 PIN、签名内容、设备序列号、账户名或完整 secret reference。
+
+发布前还必须完成真实签名、错误 PIN 尝试次数、设备拔插、Touch ID、OpenSSH 版本矩阵、
+DebianForm、全屏 Space、代码签名和 notarization 验收。
