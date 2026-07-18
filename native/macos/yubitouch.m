@@ -131,7 +131,7 @@ static void YTBuildPanel(void) {
     YTIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     [content addSubview:YTIconView];
 
-    YTApplicationIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(84, 66, 24, 24)];
+    YTApplicationIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(84, 60, 32, 32)];
     YTApplicationIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     YTApplicationIconView.hidden = YES;
     [content addSubview:YTApplicationIconView];
@@ -200,7 +200,7 @@ static void YTShow(NSString *symbol, NSColor *color, NSString *title, NSString *
     YTApplicationIconView.toolTip = applicationIcon == nil ? nil : title;
     YTTitleLabel.frame = applicationIcon == nil
         ? NSMakeRect(84, 62, 286, 28)
-        : NSMakeRect(116, 62, 254, 28);
+        : NSMakeRect(124, 62, 246, 28);
     YTTitleLabel.stringValue = title;
     YTTitleLabel.toolTip = title;
     YTSubtitleLabel.stringValue = subtitle;
