@@ -6,8 +6,303 @@ YubiTouch 是一个面向 macOS、YubiKey PIV、YKCS11 和 OpenSSH 的本地 SSH
 YubiTouch 是独立开源项目，与 Yubico 没有关联，也未获得 Yubico 的认可或背书。
 
 > 当前状态：v0.1 开发版。Agent 代理、LaunchAgent、OpenSSH backend、AskPass、
-> 1Password Go SDK、原生 UI 和诊断命令已经实现；发布签名、公证以及真实
-> YubiKey/多版本 OpenSSH 兼容矩阵仍需完成。
+> 1Password Go SDK、原生 UI 和主要真实环境兼容性验证已经完成；Developer ID 签名、
+> Apple 公证和正式发布尚未完成。
+
+## 安装与首次使用
+
+当前尚无经过 Developer ID 签名和 Apple 公证的正式安装包。请只从你信任的源码
+checkout 构建。下面是从一把未配置的 YubiKey 到首次 SSH 登录的完整步骤。
+
+### 1. 安装依赖
+
+要求 macOS 13 或更高版本、YubiKey 5.7 或更高固件、Go 1.25 或更高版本，以及 Xcode
+Command Line Tools。PIV 的 ED25519 支持从 YubiKey 5.7 开始，OpenSSH 的 ED25519
+PKCS#11 支持从 10.1 开始。
+
+```sh
+xcode-select -p
+brew install go openssh yubico-piv-tool ykman
+
+ykman --version
+"$(brew --prefix openssh)/bin/ssh" -V
+```
+
+如果 `xcode-select -p` 失败，先运行 `xcode-select --install` 并完成 Apple 的安装界面。
+
+1Password 模式还需要 1Password 桌面应用。在 **Settings > Developer** 中启用
+**Integrate with other apps**，并按需启用 Touch ID。YubiTouch 使用 1Password Go SDK，
+不需要 `op` CLI。
+
+### 2. 配置 YubiKey PIV 9A
+
+这一节会修改 YubiKey。开始前必须有备用登录方式，例如第二把 key、云主机控制台或另一
+个管理员账号。不要猜 PIN；错误 PIN 会消耗设备的有限重试次数。
+
+先检查固件、PIV 状态和 9A 槽位：
+
+```sh
+ykman info
+ykman piv info
+ykman piv keys info 9a
+```
+
+如果 9A 已有重要密钥，立即停止，不要执行下面的生成或导入命令。`ykman piv reset` 会
+清空整个 PIV 应用中的密钥和证书，YubiTouch 的安装不需要运行它。
+
+全新的 PIV 应先修改默认 PIN、PUK 和 Management Key。下面的命令会交互式读取旧值和
+新值，不要把这些值写进命令行参数：
+
+```sh
+ykman piv access change-pin
+ykman piv access change-puk
+ykman piv access change-management-key \
+  --algorithm AES192 \
+  --generate \
+  --protect \
+  --touch
+```
+
+把新 PIN 和 PUK 分开保存在可靠的密码管理器或离线恢复记录中。受 PIN 保护的随机
+Management Key 留在 YubiKey 内，`--touch` 使后续 PIV 管理操作也需要触摸。
+
+推荐直接在 YubiKey 内生成新的 ED25519 私钥。私钥从不离开设备：
+
+```sh
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+
+piv_public_key="$HOME/.ssh/yubikey-piv-9a.pem"
+
+ykman piv keys generate \
+  --algorithm ED25519 \
+  --pin-policy ONCE \
+  --touch-policy ALWAYS \
+  9a "$piv_public_key"
+
+ykman piv certificates generate \
+  --subject "CN=SSH PIV Authentication" \
+  --valid-days 3650 \
+  9a "$piv_public_key"
+
+ykman piv keys info 9a
+```
+
+最终元数据必须显示 `Algorithm: ED25519`、`PIN required for use: ONCE` 和
+`Touch required for use: ALWAYS`。PIN 策略只在生成或导入时设置；如果 Touch 显示为
+`NEVER`，不能原地修改，必须在确认恢复路径后重新写入 9A。
+
+如果必须保持现有 SSH 公钥，可以把现有 ED25519 私钥以加密 PKCS#8 形式导入 9A：
+
+```sh
+ykman piv keys import \
+  --pin-policy ONCE \
+  --touch-policy ALWAYS \
+  9a /path/to/encrypted-ed25519-pkcs8.pem
+
+ykman piv certificates import \
+  9a /path/to/ssh-piv-certificate.pem
+```
+
+私钥转换、证书创建、指纹核对和迁移文件清理可参考
+[macOS 使用 YubiKey PIV + YKCS11 保护现有 SSH 密钥](https://gist.github.com/mofelee/e4ececb2f1512b4c5bb588a45a08d1bc)
+的第 5 至 9 节。`ykman` 5.9.2 的 ED25519 `--verify` 存在已知缺口，导入证书时不要添加
+该参数。导入方案中的原始私钥副本仍可绕过 YubiKey；只有确认备用和恢复路径后才能处理
+这些副本。Gist 后续的自建 Agent、`Match exec` 和通知脚本已由 YubiTouch 取代，不要安装。
+
+通过项目实际使用的 YKCS11 provider 导出 SSH 公钥：
+
+```sh
+provider="$(brew --prefix yubico-piv-tool)/lib/libykcs11.dylib"
+ssh_keygen="$(brew --prefix openssh)/bin/ssh-keygen"
+
+"$ssh_keygen" -D "$provider"
+"$ssh_keygen" -D "$provider" |
+  awk '$1 == "ssh-ed25519"' > "$HOME/.ssh/yubikey-piv.pub"
+
+test "$(wc -l < "$HOME/.ssh/yubikey-piv.pub")" -eq 1
+chmod 600 "$HOME/.ssh/yubikey-piv.pub"
+"$ssh_keygen" -lf "$HOME/.ssh/yubikey-piv.pub"
+```
+
+YKCS11 通常还会列出 RSA PIV Attestation key；它不是 SSH 登录 key，不要删除 F9
+Attestation 槽位。如果行数检查失败，说明存在多个或没有 ED25519 key，请删除错误的
+`yubikey-piv.pub` 并人工选择注释为 `PIV Authentication` 的 9A 公钥。
+
+使用已有且可信的登录方式，把 `~/.ssh/yubikey-piv.pub` 加入每台目标服务器对应账户的
+`~/.ssh/authorized_keys`。服务器只需要公钥，不要复制私钥。导入原有 SSH 私钥且指纹完全
+一致时，服务器已有的公钥无需修改。
+
+### 3. 构建并安装 YubiTouch
+
+```sh
+git clone https://github.com/mofelee/yubitouch.git
+cd yubitouch
+
+make test
+make vet
+make app
+
+ditto dist/YubiTouch.app /Applications/YubiTouch.app
+mkdir -p "$HOME/.local/bin"
+ln -sfn /Applications/YubiTouch.app/Contents/MacOS/yubitouch \
+  "$HOME/.local/bin/yubitouch"
+export PATH="$HOME/.local/bin:$PATH"
+yubitouch version
+```
+
+应用必须先放到稳定位置，再注册 LaunchAgent。注册后移动或删除应用会使登录启动路径失效。
+把 `export PATH="$HOME/.local/bin:$PATH"` 保留在 `~/.zprofile` 后，重启终端也可以直接运行
+`yubitouch`，无需设置临时 `$YT` 变量。
+
+### 4. 配置 PIN 来源并启动服务
+
+YubiTouch 只把非敏感配置保存到 `~/.ssh/yubitouch/config.json`。不要设置
+`YUBITOUCH_PIN`；PIN 不会保存在配置、环境变量、命令行或日志中。
+
+选择一种 PIN 来源并保存配置，只执行下面两组命令中的一组。
+
+使用系统安全输入框：
+
+```sh
+YUBITOUCH_PIN_PROVIDER=prompt \
+YUBITOUCH_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub" \
+yubitouch configure
+```
+
+使用 1Password Desktop App Integration：
+
+```sh
+YUBITOUCH_PIN_PROVIDER=1password \
+YUBITOUCH_1PASSWORD_ACCOUNT='My Account' \
+YUBITOUCH_1PASSWORD_REF='op://Personal/YubiKey PIV/pin' \
+YUBITOUCH_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub" \
+yubitouch configure
+```
+
+使用 1Password 时，先创建保存 PIV PIN 的字段，并复制该字段的 `op://` secret
+reference。`YUBITOUCH_1PASSWORD_ACCOUNT` 可以是 1Password 显示的账户名或账户 UUID；
+配置文件保存 reference，不保存其指向的 PIN。
+
+上述环境变量只在执行 `configure` 时使用。配置保存后，登录启动的 daemon 直接读取配置
+文件，不依赖 shell 环境变量。随后注册当前 GUI 用户的 LaunchAgent 并验收：
+
+```sh
+yubitouch ensure
+yubitouch doctor
+yubitouch status
+yubitouch test-sign
+```
+
+`ensure` 创建 `~/Library/LaunchAgents/com.github.mofelee.yubitouch.plist`。重新登录后服务会
+自动恢复公共 Agent socket，但不会提前读取 PIN、调用 1Password 或加载 YKCS11。只有
+`test-sign` 或 SSH 的真实签名请求才会加载 provider。
+
+`test-sign` 成功时会输出：
+
+```text
+Test signature succeeded. Signature data was not retained.
+```
+
+### 5. 配置并使用 SSH
+
+在 `~/.ssh/config` 中让目标主机使用公共 Agent socket 和 PIV 公钥：
+
+```sshconfig
+Host example-yubikey
+    HostName server.example.com
+    User your-user
+    IdentityAgent ~/.ssh/yubitouch/agent.sock
+    IdentityFile ~/.ssh/yubikey-piv.pub
+    IdentitiesOnly yes
+    ForwardAgent no
+    ControlMaster auto
+    ControlPersist 10m
+    ControlPath ~/.ssh/yubitouch-%C.sock
+```
+
+之后直接运行 `ssh example-yubikey`。首次建立连接会请求 PIN 或 1Password 授权，并显示
+YubiKey 触摸提示；复用已有 `ControlMaster` 连接时不会产生新签名，因此没有 UI。
+
+检查 OpenSSH 最终采用的配置并连接：
+
+```sh
+ssh -G example-yubikey |
+  awk '$1 ~ /^(identityagent|identityfile|identitiesonly|forwardagent|controlmaster|controlpath|controlpersist)$/ {print}'
+
+ssh example-yubikey
+```
+
+需要强制进行一次新签名时，先关闭复用的 master：
+
+```sh
+ssh -O exit example-yubikey
+ssh example-yubikey
+```
+
+跳板和目标都接受同一 PIV key 时可以直接使用 ProxyJump：
+
+```sshconfig
+Host bastion
+    HostName bastion.example.com
+    User your-user
+
+Host internal-target
+    HostName target.internal
+    User your-user
+    ProxyJump bastion
+
+Host bastion internal-target
+    IdentityAgent ~/.ssh/yubitouch/agent.sock
+    IdentityFile ~/.ssh/yubikey-piv.pub
+    IdentitiesOnly yes
+    ForwardAgent no
+    ControlMaster auto
+    ControlPersist 10m
+    ControlPath ~/.ssh/yubitouch-%C.sock
+```
+
+运行 `ssh internal-target` 时，OpenSSH 会从本机分别认证跳板和目标，不需要 Agent
+Forwarding。YubiTouch 有意不支持把 Agent 转发到远程主机，请保持 `ForwardAgent no`。
+
+### 6. 日常维护、更新和卸载
+
+常用命令：
+
+```text
+yubitouch status          查看脱敏状态
+yubitouch doctor          检查依赖、权限、设备和 SSH 配置
+yubitouch test-sign       独立测试 PIN、触摸和签名链路
+yubitouch reload          重启服务并读取配置
+yubitouch stop            停止当前用户的 LaunchAgent
+```
+
+从源码更新：
+
+```sh
+cd /path/to/yubitouch
+git pull --ff-only
+make test
+make vet
+make app
+
+yubitouch stop
+ditto dist/YubiTouch.app /Applications/YubiTouch.app
+yubitouch ensure
+yubitouch doctor
+```
+
+卸载应用和登录服务：
+
+```sh
+yubitouch stop
+rm -f "$HOME/Library/LaunchAgents/com.github.mofelee.yubitouch.plist"
+rm -f "$HOME/.local/bin/yubitouch"
+rm -rf /Applications/YubiTouch.app
+```
+
+最后从 `~/.ssh/config` 删除对应 Host 配置。确认不再需要配置和诊断日志后，可以自行删除
+`~/.ssh/yubitouch`。PIV 私钥始终留在 YubiKey 中，不会随应用卸载而删除。
 
 ## 工作方式
 
@@ -105,7 +400,7 @@ chmod 700 ~/.ssh
 "$(brew --prefix openssh)/bin/ssh-keygen" -D "$(brew --prefix yubico-piv-tool)/lib/libykcs11.dylib"
 "$(brew --prefix openssh)/bin/ssh-keygen" -D "$(brew --prefix yubico-piv-tool)/lib/libykcs11.dylib" | awk '$1 == "ssh-ed25519"' > ~/.ssh/yubikey-piv.pub
 test "$(wc -l < ~/.ssh/yubikey-piv.pub)" -eq 1
-chmod 644 ~/.ssh/yubikey-piv.pub
+chmod 600 ~/.ssh/yubikey-piv.pub
 ```
 
 YubiTouch v0.1 要求该文件是 `ssh-ed25519` PIV 9A 公钥。不要使用 YKCS11 返回的 RSA
