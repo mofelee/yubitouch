@@ -7,6 +7,9 @@ static NSPanel *YTPanel;
 static NSView *YTContentView;
 static NSImageView *YTIconView;
 static NSImageView *YTApplicationIconView;
+static NSImageView *YTServiceIconView;
+static NSView *YTLeftConnectorView;
+static NSView *YTRightConnectorView;
 static NSTextField *YTTitleLabel;
 static NSTextField *YTSubtitleLabel;
 static NSButton *YTCancelButton;
@@ -89,6 +92,8 @@ static void YTUpdatePanelAppearance(void) {
     dispatch_block_t update = ^{
         YTContentView.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
         YTContentView.layer.borderColor = NSColor.separatorColor.CGColor;
+        YTLeftConnectorView.layer.backgroundColor = NSColor.separatorColor.CGColor;
+        YTRightConnectorView.layer.backgroundColor = NSColor.separatorColor.CGColor;
         YTTitleLabel.textColor = NSColor.labelColor;
         YTSubtitleLabel.textColor = NSColor.secondaryLabelColor;
         YTCancelButton.contentTintColor = NSColor.labelColor;
@@ -105,7 +110,7 @@ static void YTBuildPanel(void) {
     if (YTPanel != nil) {
         return;
     }
-    NSRect frame = NSMakeRect(0, 0, 420, 116);
+    NSRect frame = NSMakeRect(0, 0, 432, 160);
     YTPanel = [[NSPanel alloc] initWithContentRect:frame
                                          styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                            backing:NSBackingStoreBuffered
@@ -127,18 +132,32 @@ static void YTBuildPanel(void) {
     YTContentView = content;
     YTPanel.contentView = content;
 
-    YTIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 34, 48, 48)];
+    YTTitleLabel = YTLabel(NSMakeRect(44, 126, 344, 24), 17, NSFontWeightSemibold, NSColor.labelColor);
+    YTTitleLabel.alignment = NSTextAlignmentCenter;
+    [content addSubview:YTTitleLabel];
+
+    YTLeftConnectorView = [[NSView alloc] initWithFrame:NSMakeRect(148, 81, 54, 1)];
+    YTLeftConnectorView.wantsLayer = YES;
+    [content addSubview:YTLeftConnectorView];
+    YTRightConnectorView = [[NSView alloc] initWithFrame:NSMakeRect(230, 81, 54, 1)];
+    YTRightConnectorView.wantsLayer = YES;
+    [content addSubview:YTRightConnectorView];
+
+    YTApplicationIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(96, 56, 52, 52)];
+    YTApplicationIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [content addSubview:YTApplicationIconView];
+
+    YTIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(202, 68, 28, 28)];
     YTIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     [content addSubview:YTIconView];
 
-    YTApplicationIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(84, 60, 32, 32)];
-    YTApplicationIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
-    YTApplicationIconView.hidden = YES;
-    [content addSubview:YTApplicationIconView];
+    YTServiceIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(284, 56, 52, 52)];
+    YTServiceIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    YTServiceIconView.toolTip = @"YubiTouch";
+    [content addSubview:YTServiceIconView];
 
-    YTTitleLabel = YTLabel(NSMakeRect(84, 62, 286, 28), 18, NSFontWeightSemibold, NSColor.labelColor);
-    [content addSubview:YTTitleLabel];
-    YTSubtitleLabel = YTLabel(NSMakeRect(84, 30, 316, 22), 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    YTSubtitleLabel = YTLabel(NSMakeRect(32, 24, 368, 20), 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    YTSubtitleLabel.alignment = NSTextAlignmentCenter;
     [content addSubview:YTSubtitleLabel];
 
     YTCancelTargetInstance = [[YTCancelTarget alloc] init];
@@ -146,7 +165,7 @@ static void YTBuildPanel(void) {
     YTCancelButton = [NSButton buttonWithImage:cancelImage
                                         target:YTCancelTargetInstance
                                         action:@selector(cancelSigning:)];
-    YTCancelButton.frame = NSMakeRect(380, 76, 28, 28);
+    YTCancelButton.frame = NSMakeRect(396, 126, 24, 24);
     YTCancelButton.bezelStyle = NSBezelStyleCircular;
     YTCancelButton.bordered = NO;
     YTCancelButton.toolTip = @"取消签名";
@@ -168,11 +187,23 @@ static void YTPositionPanel(void) {
     [YTPanel setFrame:frame display:YES];
 }
 
-static NSImage *YTSymbol(NSString *name, NSColor *color) {
+static NSImage *YTSymbol(NSString *name, NSColor *color, CGFloat pointSize) {
     NSImage *image = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
-    NSImageSymbolConfiguration *configuration = [NSImageSymbolConfiguration configurationWithPointSize:36 weight:NSFontWeightSemibold];
+    NSImageSymbolConfiguration *configuration = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightSemibold];
     configuration = [configuration configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:color]];
     return [image imageWithSymbolConfiguration:configuration];
+}
+
+static NSImage *YTFallbackApplicationIcon(void) {
+    return YTSymbol(@"terminal.fill", NSColor.secondaryLabelColor, 40);
+}
+
+static NSImage *YTServiceIcon(void) {
+    NSImage *icon = NSApp.applicationIconImage;
+    if (icon != nil) {
+        return icon;
+    }
+    return YTSymbol(@"key.horizontal.fill", NSColor.systemBlueColor, 40);
 }
 
 static NSImage *YTApplicationIcon(NSString *bundleIdentifier) {
@@ -193,14 +224,11 @@ static void YTShow(NSString *symbol, NSColor *color, NSString *title, NSString *
     YTBuildPanel();
     YTUpdatePanelAppearance();
     YTGeneration++;
-    YTIconView.image = YTSymbol(symbol, color);
+    YTIconView.image = YTSymbol(symbol, color, 22);
     NSImage *applicationIcon = YTApplicationIcon(bundleIdentifier);
-    YTApplicationIconView.image = applicationIcon;
-    YTApplicationIconView.hidden = applicationIcon == nil;
-    YTApplicationIconView.toolTip = applicationIcon == nil ? nil : title;
-    YTTitleLabel.frame = applicationIcon == nil
-        ? NSMakeRect(84, 62, 286, 28)
-        : NSMakeRect(124, 62, 246, 28);
+    YTApplicationIconView.image = applicationIcon == nil ? YTFallbackApplicationIcon() : applicationIcon;
+    YTApplicationIconView.toolTip = title;
+    YTServiceIconView.image = YTServiceIcon();
     YTTitleLabel.stringValue = title;
     YTTitleLabel.toolTip = title;
     YTSubtitleLabel.stringValue = subtitle;
