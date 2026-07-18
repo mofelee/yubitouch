@@ -162,6 +162,12 @@ yubitouch version
 把 `export PATH="$HOME/.local/bin:$PATH"` 保留在 `~/.zprofile` 后，重启终端也可以直接运行
 `yubitouch`，无需设置临时 `$YT` 变量。
 
+`yubitouch version` 中的十六进制值是构建时的 Git commit，不是每次 `make app` 都会变化的
+构建序号。同一个 commit 重新构建仍会显示同一个值；可以用 `git rev-parse --short=12 HEAD`
+核对。该命令只验证磁盘上的 CLI，不能证明已经运行的 LaunchAgent daemon 已经重启。
+首次安装请继续完成下一步的 `configure` 和 `ensure`；覆盖已有安装时请使用下文“从源码
+更新”的停服、复制和重新启动顺序。
+
 ### 4. 配置 PIN 来源并启动服务
 
 YubiTouch 只把非敏感配置保存到 `~/.ssh/yubitouch/config.json`。不要设置
@@ -296,11 +302,22 @@ make test
 make vet
 make app
 
+# 必须先停止仍在运行的旧 daemon，再覆盖磁盘上的 App。
 yubitouch stop
 ditto dist/YubiTouch.app /Applications/YubiTouch.app
+
+# 这两行应显示相同的 commit；相同 commit 重建时哈希不会改变。
+git rev-parse --short=12 HEAD
+yubitouch version
+
+# ensure 从刚复制的 App 启动新的 LaunchAgent daemon。
 yubitouch ensure
 yubitouch doctor
 ```
+
+不要只运行 `make app`、`ditto` 和 `yubitouch version`：`version` 会启动一个短暂的 CLI
+进程读取新二进制，但原有 daemon 仍可能继续运行旧代码。上述 `stop -> ditto -> ensure`
+顺序会明确替换后台进程；更新非敏感配置但没有替换 App 时，使用 `yubitouch reload` 即可。
 
 卸载应用和登录服务：
 
@@ -580,6 +597,7 @@ yubitouch version         显示版本和提交信息
 | 1Password 初始化失败 | 解锁桌面应用，启用 Integrate with other apps，检查 account/reference 后重新 `configure`。 |
 | 1Password 授权超时后窗口仍显示 | YubiTouch 已终止自己的 helper；在 1Password 中手动取消该窗口。当前 SDK 上游 #266 不响应 context 取消。 |
 | 签名超时 | 保持设备连接，在提示出现后触摸；YubiTouch 不会自动重试该请求。 |
+| 重建后版本哈希或界面看起来未更新 | 哈希是 Git commit，不是构建序号。用 `git rev-parse --short=12 HEAD` 核对，然后按 `yubitouch stop`、`ditto`、`yubitouch ensure` 的顺序替换运行中的 daemon。 |
 | 配置或路径修改后行为未变化 | 重新 `configure`，再运行 `yubitouch reload`。 |
 | stale socket/backend 错误 | 先 `yubitouch stop`，确认受管服务停止后再 `yubitouch ensure`；不要手工杀死未知 agent。 |
 
