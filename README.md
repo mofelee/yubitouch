@@ -296,6 +296,53 @@ Host bastion internal-target
 运行 `ssh internal-target` 时，OpenSSH 会从本机分别认证跳板和目标，不需要 Agent
 Forwarding。YubiTouch 有意不支持把 Agent 转发到远程主机，请保持 `ForwardAgent no`。
 
+#### 使用 YubiKey 签署 GitHub Commit
+
+GitHub 的 SSH 登录认证和 Commit 签名是两种独立用途。打开
+[SSH and GPG keys](https://github.com/settings/keys)，把 `~/.ssh/yubikey-piv.pub` 的完整
+内容添加为 `Signing Key`。如果同一把 key 已经用于 GitHub SSH 登录，仍需再添加一次并将
+类型选择为 `Signing Key`。Commit 使用的邮箱也必须是 GitHub 账户中已验证的邮箱。
+
+Git 的 `gpg.ssh.program` 需要调用标准 `ssh-keygen`，而签名进程还必须连接 YubiTouch
+Agent socket。为了不替换终端、IDE 或其他程序的默认 `SSH_AUTH_SOCK`，先创建一个只供
+Git 签名使用的本地 wrapper。`yubitouch-ssh-sign` 不是项目自带命令；下面的命令会生成它，
+并在生成时记录当前 Mac 上 Homebrew OpenSSH 的稳定路径：
+
+```sh
+ssh_keygen="$(brew --prefix openssh)/bin/ssh-keygen"
+mkdir -p "$HOME/.local/bin"
+
+cat > "$HOME/.local/bin/yubitouch-ssh-sign" <<EOF
+#!/bin/sh
+export SSH_AUTH_SOCK="\$HOME/.ssh/yubitouch/agent.sock"
+exec "$ssh_keygen" "\$@"
+EOF
+
+chmod 700 "$HOME/.local/bin/yubitouch-ssh-sign"
+```
+
+然后配置当前用户的 Git。`user.signingkey` 使用公钥文件路径；私钥仍留在 YubiKey 中：
+
+```sh
+git config --global user.signingkey "$HOME/.ssh/yubikey-piv.pub"
+git config --global gpg.format ssh
+git config --global gpg.ssh.program "$HOME/.local/bin/yubitouch-ssh-sign"
+git config --global commit.gpgsign true
+git config --global tag.gpgSign true
+```
+
+如果原配置使用 1Password 的 `op-ssh-sign`，第三条命令会只把 Git Commit/Tag 的签名程序
+切换到 YubiTouch wrapper，不会改变 SSH Host 的 `IdentityAgent` 配置。检查最终配置：
+
+```sh
+git config --global --get-regexp \
+  '^(user.signingkey|gpg.format|gpg.ssh.program|commit.gpgsign|tag.gpgsign)$'
+```
+
+之后正常运行 `git commit` 或 `git tag -s` 即可。首次加载 provider 时会请求 PIN 或
+1Password 授权，每次实际签名都会显示 YubiKey 触摸提醒。推送到 GitHub 后，正确关联的
+签名会显示 `Verified`。
+
 ### 6. 日常维护、更新和卸载
 
 常用命令：
