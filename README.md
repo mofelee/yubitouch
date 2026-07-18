@@ -9,6 +9,11 @@ YubiTouch 是独立开源项目，与 Yubico 没有关联，也未获得 Yubico 
 > 1Password Go SDK、原生 UI 和主要真实环境兼容性验证已经完成。项目只支持用户从可信
 > 源码在本机完成构建与安装，不计划提供预编译应用、Developer ID 签名/公证或 Homebrew 包。
 
+<p align="center">
+  <img src="docs/images/touch-notification.webp" alt="YubiTouch SSH 签名触摸提醒" width="760">
+</p>
+<p align="center"><sub>真实签名请求会显示请求方、YubiTouch 和当前触摸状态。</sub></p>
+
 ## 安装与首次使用
 
 项目不提供预编译安装包。请只从你信任的源码 checkout 在本机构建。下面是从一把未配置
@@ -183,6 +188,11 @@ YUBITOUCH_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub" \
 yubitouch configure
 ```
 
+<p align="center">
+  <img src="docs/images/piv-pin-prompt.webp" alt="YubiTouch 系统安全 PIN 输入框" width="560">
+</p>
+<p align="center"><sub>系统安全输入框模式：PIN 只用于加载 PIV provider，不会保存。</sub></p>
+
 使用 1Password Desktop App Integration：
 
 ```sh
@@ -196,6 +206,11 @@ yubitouch configure
 使用 1Password 时，先创建保存 PIV PIN 的字段，并复制该字段的 `op://` secret
 reference。`YUBITOUCH_1PASSWORD_ACCOUNT` 可以是 1Password 显示的账户名或账户 UUID；
 配置文件保存 reference，不保存其指向的 PIN。
+
+<p align="center">
+  <img src="docs/images/onepassword-authorization.webp" alt="1Password 授权 YubiTouch 读取 PIN" width="680">
+</p>
+<p align="center"><sub>1Password 模式：由桌面应用授权读取 PIN，不显示系统 PIN 输入框。</sub></p>
 
 上述环境变量只在执行 `configure` 时使用。配置保存后，登录启动的 daemon 直接读取配置
 文件，不依赖 shell 环境变量。随后注册当前 GUI 用户的 LaunchAgent 并验收：
