@@ -107,6 +107,18 @@ ssh -S /tmp/yubitouch-control.sock -O exit example-yubikey
 DebianForm 只配置普通 SSH Host/IdentityAgent/IdentityFile，不安装 wrapper 或额外 hook。分别记录
 新连接和应用自身连接复用的表现；`ssh -G`、DebianForm 配置解析和 identity list 均不得显示 UI。
 
+显式 `session-bind@openssh.com` 实机验证使用本地公共 Agent socket，不开启 Agent Forwarding，
+也不连接远程主机：
+
+```sh
+YUBITOUCH_LIVE_AGENT_SOCKET="$HOME/.ssh/yubitouch/agent.sock" \
+  go test ./internal/agentproxy -run '^TestLiveAgentSessionBindRoundTrip$' -count=1 -v
+```
+
+测试在内存中生成临时 host key、session ID 和有效 host signature，先发送 session-bind，再通过
+同一客户端连接执行目标 key 签名并验证结果。这样覆盖公共代理的缓存、真实 OpenSSH backend
+重放和 YubiKey 签名链路，不把 Agent 暴露给远端。
+
 ## UI 与安全检查
 
 在普通桌面、多 Space 和全屏应用中检查等待、成功、失败和超时状态。确认提示不抢焦点，
