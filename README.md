@@ -5,14 +5,14 @@ YubiTouch 是一个面向 macOS、YubiKey PIV、YKCS11 和 OpenSSH 的本地 SSH
 
 YubiTouch 是独立开源项目，与 Yubico 没有关联，也未获得 Yubico 的认可或背书。
 
-> 当前状态：v0.1 开发版。Agent 代理、LaunchAgent、OpenSSH backend、AskPass、
-> 1Password Go SDK、原生 UI 和主要真实环境兼容性验证已经完成；Developer ID 签名、
-> Apple 公证和正式发布尚未完成。
+> 当前状态：v0.1 源码构建版。Agent 代理、LaunchAgent、OpenSSH backend、AskPass、
+> 1Password Go SDK、原生 UI 和主要真实环境兼容性验证已经完成。项目只支持用户从可信
+> 源码在本机完成构建与安装，不计划提供预编译应用、Developer ID 签名/公证或 Homebrew 包。
 
 ## 安装与首次使用
 
-当前尚无经过 Developer ID 签名和 Apple 公证的正式安装包。请只从你信任的源码
-checkout 构建。下面是从一把未配置的 YubiKey 到首次 SSH 登录的完整步骤。
+项目不提供预编译安装包。请只从你信任的源码 checkout 在本机构建。下面是从一把未配置
+的 YubiKey 到首次 SSH 登录的完整步骤。
 
 ### 1. 安装依赖
 
@@ -370,29 +370,8 @@ mkdir -p ~/.local/bin
 ln -sfn /Applications/YubiTouch.app/Contents/MacOS/yubitouch ~/.local/bin/yubitouch
 ```
 
-正式发布还需要 Developer ID 签名和 notarization；当前构建脚本不会伪装已完成这些步骤。
-
-### Release candidate
-
-Release 构建必须在目标架构的原生 macOS runner 上完成，因为 Cocoa 和 1Password SDK 使用
-CGO。分别在 Apple Silicon (`arm64`) 和 Intel (`amd64`) runner 构建，不把单架构产物标记为
-universal。正式构建要求干净 worktree、`v<version>` tag、Developer ID 和 notarytool profile：
-
-```sh
-CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-NOTARY_PROFILE='yubitouch-notary' \
-make release VERSION=0.1.0
-```
-
-输出目录为 `dist/release/<version>/<arch>/`，包含 `YubiTouch.app` zip、独立 CLI、
-`SHA256SUMS`、`release.json` 和 release notes。未签名、未打 tag 的本地候选只能显式运行：
-
-```sh
-ALLOW_DIRTY=1 ALLOW_UNTAGGED=1 ALLOW_UNSIGNED=1 make release VERSION=0.1.0
-```
-
-未签名候选会固定 app 文件时间并使用无额外 zip metadata 的排序归档，可用于复现性比较；
-Developer ID timestamp 和 notarization ticket 会使正式签名产物包含 Apple 服务生成的数据。
+`make app` 只生成当前 Mac 原生架构的本地应用。项目不分发该产物，也不把它标记为已签名、
+已公证或 universal。其他用户应在自己的目标 Mac 上从源码运行测试并构建。
 
 ## 配置
 
@@ -651,5 +630,6 @@ plist 和脱敏状态。子进程崩溃测试还覆盖公共 socket 恢复、无
 记录模板见 [`docs/verification.md`](docs/verification.md)。更新矩阵时必须记录版本和结果，
 不得附加 PIN、签名内容、设备序列号、账户名或完整 secret reference。
 
-发布前还必须完成真实签名、错误 PIN 尝试次数、设备拔插、Touch ID、OpenSSH 版本矩阵、
-DebianForm、全屏 Space、代码签名和 notarization 验收。
+真实签名、设备拔插、Touch ID、OpenSSH/YKCS11 版本矩阵、DebianForm 和全屏 Space 已完成
+验收。错误 PIN 测试只应在确认剩余尝试次数的测试设备上执行；1Password 授权窗口取消能力
+继续由上游 SDK 问题跟踪，不阻止源码构建使用。
