@@ -19,6 +19,25 @@ func TestSignFailureMessageDistinguishesRemovedDevice(t *testing.T) {
 	}
 }
 
+func TestRequesterTextKeepsTouchInstructionAndDirectClient(t *testing.T) {
+	requester := signing.Requester{Name: "Terminal", DirectClient: "ssh"}
+	if got := requesterName(requester); got != "Terminal" {
+		t.Fatalf("requester name = %q", got)
+	}
+	if got := waitingSubtitle(requester); got != "请触摸 YubiKey · 直接客户端 ssh" {
+		t.Fatalf("waiting subtitle = %q", got)
+	}
+}
+
+func TestRequesterTextUsesStableFallback(t *testing.T) {
+	if got := requesterName(signing.Requester{}); got != "未知程序" {
+		t.Fatalf("requester fallback = %q", got)
+	}
+	if got := waitingSubtitle(signing.Requester{Name: "YubiTouch", DirectClient: "YubiTouch"}); got != "请触摸 YubiKey" {
+		t.Fatalf("same-client subtitle = %q", got)
+	}
+}
+
 func TestCancellationWatcherConsumesSignalOnce(t *testing.T) {
 	app := New("none")
 	var requestID atomic.Uint64

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/clientidentity"
 	"github.com/mofelee/yubitouch/internal/signing"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -44,6 +45,7 @@ type Server struct {
 	BackendFactory    BackendFactory
 	Coordinator       *signing.Coordinator
 	disconnectWatcher func(context.Context, net.Conn)
+	requesterResolver func(net.Conn) signing.Requester
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
@@ -87,6 +89,11 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		connectionMu.Lock()
 		connections[conn] = struct{}{}
 		connectionMu.Unlock()
+		resolver := s.requesterResolver
+		if resolver == nil {
+			resolver = clientidentity.Resolve
+		}
+		requester := resolver(conn)
 		connectionWG.Add(1)
 		go func() {
 			defer connectionWG.Done()
@@ -95,12 +102,16 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 				delete(connections, conn)
 				connectionMu.Unlock()
 			}()
-			s.serveConn(ctx, conn)
+			s.serveConnFor(ctx, conn, requester)
 		}()
 	}
 }
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+	s.serveConnFor(ctx, conn, signing.Requester{})
+}
+
+func (s *Server) serveConnFor(ctx context.Context, conn net.Conn, requester signing.Requester) {
 	connectionCtx, cancel := context.WithCancel(ctx)
 	watcher := s.disconnectWatcher
 	if watcher == nil {
@@ -123,6 +134,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		comment:        s.Comment,
 		backendFactory: s.BackendFactory,
 		coordinator:    s.Coordinator,
+		requester:      requester,
 	}
 	defer frontend.close()
 	_ = agent.ServeAgent(frontend, &boundedAgentConn{Conn: conn})
@@ -226,6 +238,7 @@ type connectionAgent struct {
 	comment        string
 	backendFactory BackendFactory
 	coordinator    *signing.Coordinator
+	requester      signing.Requester
 
 	mu           sync.Mutex
 	backend      Backend
@@ -258,8 +271,9 @@ func (a *connectionAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	if err != nil {
 		return nil, err
 	}
-	return a.coordinator.SignCancelable(
+	return a.coordinator.SignCancelableFor(
 		a.ctx,
+		a.requester,
 		func() (*ssh.Signature, error) {
 			return backend.SignWithFlags(key, data, flags)
 		},

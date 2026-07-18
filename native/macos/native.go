@@ -9,9 +9,9 @@ package macos
 void YTInitializeApplication(void);
 void YTRunApplication(void);
 void YTStopApplication(void);
-void YTShowWaiting(const char *soundName, unsigned long long requestID);
-void YTShowSuccess(unsigned long long requestID);
-void YTShowFailure(const char *message, unsigned long long requestID);
+void YTShowWaiting(const char *soundName, const char *title, const char *subtitle, const char *bundleIdentifier, unsigned long long requestID);
+void YTShowSuccess(const char *title, const char *bundleIdentifier, unsigned long long requestID);
+void YTShowFailure(const char *title, const char *message, const char *bundleIdentifier, unsigned long long requestID);
 void YTHide(unsigned long long requestID);
 unsigned long long YTConsumeCancelRequest(void);
 void YTShowAbout(void);
@@ -39,20 +39,34 @@ func StopApplication() {
 	C.YTStopApplication()
 }
 
-func ShowWaiting(sound string, requestID uint64) {
-	value := C.CString(sound)
-	defer C.free(unsafe.Pointer(value))
-	C.YTShowWaiting(value, C.ulonglong(requestID))
+func ShowWaiting(sound string, title string, subtitle string, bundleIdentifier string, requestID uint64) {
+	soundValue := C.CString(sound)
+	defer C.free(unsafe.Pointer(soundValue))
+	titleValue := C.CString(title)
+	defer C.free(unsafe.Pointer(titleValue))
+	subtitleValue := C.CString(subtitle)
+	defer C.free(unsafe.Pointer(subtitleValue))
+	bundleValue := C.CString(bundleIdentifier)
+	defer C.free(unsafe.Pointer(bundleValue))
+	C.YTShowWaiting(soundValue, titleValue, subtitleValue, bundleValue, C.ulonglong(requestID))
 }
 
-func ShowSuccess(requestID uint64) {
-	C.YTShowSuccess(C.ulonglong(requestID))
+func ShowSuccess(title string, bundleIdentifier string, requestID uint64) {
+	titleValue := C.CString(title)
+	defer C.free(unsafe.Pointer(titleValue))
+	bundleValue := C.CString(bundleIdentifier)
+	defer C.free(unsafe.Pointer(bundleValue))
+	C.YTShowSuccess(titleValue, bundleValue, C.ulonglong(requestID))
 }
 
-func ShowFailure(message string, requestID uint64) {
-	value := C.CString(message)
-	defer C.free(unsafe.Pointer(value))
-	C.YTShowFailure(value, C.ulonglong(requestID))
+func ShowFailure(title string, message string, bundleIdentifier string, requestID uint64) {
+	titleValue := C.CString(title)
+	defer C.free(unsafe.Pointer(titleValue))
+	messageValue := C.CString(message)
+	defer C.free(unsafe.Pointer(messageValue))
+	bundleValue := C.CString(bundleIdentifier)
+	defer C.free(unsafe.Pointer(bundleValue))
+	C.YTShowFailure(titleValue, messageValue, bundleValue, C.ulonglong(requestID))
 }
 
 func Hide(requestID uint64) {

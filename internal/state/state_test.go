@@ -17,7 +17,16 @@ func TestStoreWritesOnlyClassifiedState(t *testing.T) {
 	if err := store.Initialize(); err != nil {
 		t.Fatal(err)
 	}
-	store.Handle(signing.Event{Type: signing.EventFailure, At: time.Now(), Err: errors.New("sensitive lower-level detail")})
+	store.Handle(signing.Event{
+		Type: signing.EventFailure,
+		At:   time.Now(),
+		Err:  errors.New("sensitive lower-level detail"),
+		Requester: signing.Requester{
+			Name:             "Sensitive Requester",
+			DirectClient:     "private-client",
+			BundleIdentifier: "com.example.private",
+		},
+	})
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -37,8 +46,10 @@ func TestStoreWritesOnlyClassifiedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "sensitive") {
-		t.Fatal("state persisted a lower-level error")
+	contents := string(data)
+	if strings.Contains(contents, "sensitive") || strings.Contains(contents, "Sensitive Requester") ||
+		strings.Contains(contents, "private-client") || strings.Contains(contents, "com.example.private") {
+		t.Fatal("state persisted lower-level or requester identity data")
 	}
 }
 

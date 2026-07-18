@@ -6,6 +6,7 @@
 static NSPanel *YTPanel;
 static NSView *YTContentView;
 static NSImageView *YTIconView;
+static NSImageView *YTApplicationIconView;
 static NSTextField *YTTitleLabel;
 static NSTextField *YTSubtitleLabel;
 static NSButton *YTCancelButton;
@@ -104,7 +105,7 @@ static void YTBuildPanel(void) {
     if (YTPanel != nil) {
         return;
     }
-    NSRect frame = NSMakeRect(0, 0, 344, 104);
+    NSRect frame = NSMakeRect(0, 0, 420, 116);
     YTPanel = [[NSPanel alloc] initWithContentRect:frame
                                          styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                            backing:NSBackingStoreBuffered
@@ -126,13 +127,18 @@ static void YTBuildPanel(void) {
     YTContentView = content;
     YTPanel.contentView = content;
 
-    YTIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 28, 48, 48)];
+    YTIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 34, 48, 48)];
     YTIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     [content addSubview:YTIconView];
 
-    YTTitleLabel = YTLabel(NSMakeRect(86, 52, 210, 28), 20, NSFontWeightSemibold, NSColor.labelColor);
+    YTApplicationIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(84, 66, 24, 24)];
+    YTApplicationIconView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    YTApplicationIconView.hidden = YES;
+    [content addSubview:YTApplicationIconView];
+
+    YTTitleLabel = YTLabel(NSMakeRect(84, 62, 286, 28), 18, NSFontWeightSemibold, NSColor.labelColor);
     [content addSubview:YTTitleLabel];
-    YTSubtitleLabel = YTLabel(NSMakeRect(86, 27, 238, 22), 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    YTSubtitleLabel = YTLabel(NSMakeRect(84, 30, 316, 22), 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     [content addSubview:YTSubtitleLabel];
 
     YTCancelTargetInstance = [[YTCancelTarget alloc] init];
@@ -140,7 +146,7 @@ static void YTBuildPanel(void) {
     YTCancelButton = [NSButton buttonWithImage:cancelImage
                                         target:YTCancelTargetInstance
                                         action:@selector(cancelSigning:)];
-    YTCancelButton.frame = NSMakeRect(304, 62, 28, 28);
+    YTCancelButton.frame = NSMakeRect(380, 76, 28, 28);
     YTCancelButton.bezelStyle = NSBezelStyleCircular;
     YTCancelButton.bordered = NO;
     YTCancelButton.toolTip = @"取消签名";
@@ -169,13 +175,36 @@ static NSImage *YTSymbol(NSString *name, NSColor *color) {
     return [image imageWithSymbolConfiguration:configuration];
 }
 
-static void YTShow(NSString *symbol, NSColor *color, NSString *title, NSString *subtitle) {
+static NSImage *YTApplicationIcon(NSString *bundleIdentifier) {
+    if (bundleIdentifier.length == 0) {
+        return nil;
+    }
+    if ([bundleIdentifier isEqualToString:NSBundle.mainBundle.bundleIdentifier]) {
+        return NSApp.applicationIconImage;
+    }
+    NSURL *applicationURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundleIdentifier];
+    if (applicationURL == nil) {
+        return nil;
+    }
+    return [NSWorkspace.sharedWorkspace iconForFile:applicationURL.path];
+}
+
+static void YTShow(NSString *symbol, NSColor *color, NSString *title, NSString *subtitle, NSString *bundleIdentifier) {
     YTBuildPanel();
     YTUpdatePanelAppearance();
     YTGeneration++;
     YTIconView.image = YTSymbol(symbol, color);
+    NSImage *applicationIcon = YTApplicationIcon(bundleIdentifier);
+    YTApplicationIconView.image = applicationIcon;
+    YTApplicationIconView.hidden = applicationIcon == nil;
+    YTApplicationIconView.toolTip = applicationIcon == nil ? nil : title;
+    YTTitleLabel.frame = applicationIcon == nil
+        ? NSMakeRect(84, 62, 286, 28)
+        : NSMakeRect(116, 62, 254, 28);
     YTTitleLabel.stringValue = title;
+    YTTitleLabel.toolTip = title;
     YTSubtitleLabel.stringValue = subtitle;
+    YTSubtitleLabel.toolTip = subtitle;
     YTPositionPanel();
     [YTPanel orderFrontRegardless];
 }
@@ -229,12 +258,15 @@ void YTStopApplication(void) {
     });
 }
 
-void YTShowWaiting(const char *soundName, unsigned long long requestID) {
+void YTShowWaiting(const char *soundName, const char *titleText, const char *subtitleText, const char *bundleIdentifierText, unsigned long long requestID) {
     NSString *sound = soundName == NULL ? @"" : [NSString stringWithUTF8String:soundName];
+    NSString *title = titleText == NULL ? @"未知程序正在请求 SSH 签名" : [NSString stringWithUTF8String:titleText];
+    NSString *subtitle = subtitleText == NULL ? @"请触摸 YubiKey" : [NSString stringWithUTF8String:subtitleText];
+    NSString *bundleIdentifier = bundleIdentifierText == NULL ? @"" : [NSString stringWithUTF8String:bundleIdentifierText];
     YTOnMain(^{
         YTCurrentRequestID = requestID;
         atomic_store(&YTCancelRequestID, 0);
-        YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, @"请触摸 YubiKey", @"正在授权 SSH 签名");
+        YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, title, subtitle, bundleIdentifier);
         YTCancelButton.enabled = YES;
         YTCancelButton.hidden = NO;
         if (sound.length > 0 && ![sound isEqualToString:@"none"]) {
@@ -243,27 +275,31 @@ void YTShowWaiting(const char *soundName, unsigned long long requestID) {
     });
 }
 
-void YTShowSuccess(unsigned long long requestID) {
+void YTShowSuccess(const char *titleText, const char *bundleIdentifierText, unsigned long long requestID) {
+    NSString *title = titleText == NULL ? @"请求已授权" : [NSString stringWithUTF8String:titleText];
+    NSString *bundleIdentifier = bundleIdentifierText == NULL ? @"" : [NSString stringWithUTF8String:bundleIdentifierText];
     YTOnMain(^{
         if (YTCurrentRequestID != requestID) {
             return;
         }
         atomic_store(&YTCancelRequestID, 0);
         YTCancelButton.hidden = YES;
-        YTShow(@"checkmark.circle.fill", NSColor.systemGreenColor, @"已授权", @"SSH 签名已完成");
+        YTShow(@"checkmark.circle.fill", NSColor.systemGreenColor, title, @"SSH 签名已完成", bundleIdentifier);
         YTHideAfter(0.3, YTGeneration);
     });
 }
 
-void YTShowFailure(const char *message, unsigned long long requestID) {
+void YTShowFailure(const char *titleText, const char *message, const char *bundleIdentifierText, unsigned long long requestID) {
+    NSString *title = titleText == NULL ? @"请求失败" : [NSString stringWithUTF8String:titleText];
     NSString *detail = message == NULL ? @"请重试" : [NSString stringWithUTF8String:message];
+    NSString *bundleIdentifier = bundleIdentifierText == NULL ? @"" : [NSString stringWithUTF8String:bundleIdentifierText];
     YTOnMain(^{
         if (YTCurrentRequestID != requestID) {
             return;
         }
         atomic_store(&YTCancelRequestID, 0);
         YTCancelButton.hidden = YES;
-        YTShow(@"xmark.circle.fill", NSColor.systemRedColor, @"授权失败", detail);
+        YTShow(@"xmark.circle.fill", NSColor.systemRedColor, title, detail, bundleIdentifier);
         YTHideAfter(2.5, YTGeneration);
     });
 }

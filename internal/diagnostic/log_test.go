@@ -25,6 +25,11 @@ func TestStructuredLogIsPrivateAndDoesNotPersistErrorText(t *testing.T) {
 		Type: signing.EventFailure,
 		At:   time.Now(),
 		Err:  errors.New("op://Personal/YubiKey/PIN contained 123456"),
+		Requester: signing.Requester{
+			Name:             "Sensitive Requester",
+			DirectClient:     "private-client",
+			BundleIdentifier: "com.example.private",
+		},
 	})
 	if err := logger.Close(); err != nil {
 		t.Fatal(err)
@@ -42,7 +47,8 @@ func TestStructuredLogIsPrivateAndDoesNotPersistErrorText(t *testing.T) {
 		t.Fatal(err)
 	}
 	contents := string(data)
-	if strings.Contains(contents, "op://") || strings.Contains(contents, "123456") || strings.Contains(contents, "Personal") {
+	if strings.Contains(contents, "op://") || strings.Contains(contents, "123456") || strings.Contains(contents, "Personal") ||
+		strings.Contains(contents, "Sensitive Requester") || strings.Contains(contents, "private-client") || strings.Contains(contents, "com.example.private") {
 		t.Fatalf("log persisted sensitive error text: %s", contents)
 	}
 	if !strings.Contains(contents, `"event":"sign_failed"`) || !strings.Contains(contents, `"failure_class":"internal"`) {

@@ -31,6 +31,7 @@ type Event struct {
 	At        time.Time
 	Err       error
 	RequestID uint64
+	Requester Requester
 }
 
 type Sink interface {
@@ -93,10 +94,18 @@ func New(initializer Initializer, sink Sink, timeout time.Duration) *Coordinator
 }
 
 func (c *Coordinator) Sign(ctx context.Context, call func() (*ssh.Signature, error)) (*ssh.Signature, error) {
-	return c.SignCancelable(ctx, call, nil)
+	return c.SignCancelableFor(ctx, Requester{}, call, nil)
 }
 
 func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
+	return c.SignCancelableFor(ctx, Requester{}, call, cancelCall)
+}
+
+func (c *Coordinator) SignFor(ctx context.Context, requester Requester, call func() (*ssh.Signature, error)) (*ssh.Signature, error) {
+	return c.SignCancelableFor(ctx, requester, call, nil)
+}
+
+func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester, call func() (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -126,7 +135,7 @@ func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Sign
 	result := make(chan Result, 1)
 	go func() {
 		defer func() { <-c.semaphore }()
-		c.publish(Event{Type: EventInitializing, At: c.now(), RequestID: activeID})
+		c.publish(Event{Type: EventInitializing, At: c.now(), RequestID: activeID, Requester: requester})
 		if err := c.initializer.Ensure(requestCtx); err != nil {
 			result <- Result{Err: err}
 			return
@@ -135,7 +144,7 @@ func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Sign
 			result <- Result{Err: err}
 			return
 		}
-		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID})
+		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID, Requester: requester})
 		sig, err := call()
 		if err != nil {
 			if normalizer, ok := c.initializer.(SignFailureNormalizer); ok {
@@ -154,29 +163,29 @@ func (c *Coordinator) SignCancelable(ctx context.Context, call func() (*ssh.Sign
 			if errors.Is(got.Err, context.DeadlineExceeded) {
 				cancelOperation()
 				err := ErrTimeout
-				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID})
+				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID, Requester: requester})
 				return nil, err
 			}
 			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID)
+				return nil, c.finishContext(requestCtx, activeID, requester)
 			}
 			if errors.Is(got.Err, context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID)
+				return nil, c.finishContext(requestCtx, activeID, requester)
 			}
 			if errors.Is(requestCtx.Err(), context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID)
+				return nil, c.finishContext(requestCtx, activeID, requester)
 			}
-			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID})
+			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID, Requester: requester})
 			return nil, got.Err
 		}
-		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID})
+		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID, Requester: requester})
 		return got.Signature, nil
 	case <-requestCtx.Done():
 		cancelOperation()
-		return nil, c.finishContext(requestCtx, activeID)
+		return nil, c.finishContext(requestCtx, activeID, requester)
 	}
 }
 
@@ -213,13 +222,13 @@ func (c *Coordinator) LastEvent() Event {
 	return c.last
 }
 
-func (c *Coordinator) finishContext(ctx context.Context, requestID uint64) error {
+func (c *Coordinator) finishContext(ctx context.Context, requestID uint64, requester Requester) error {
 	err := contextError(ctx)
 	if errors.Is(err, ErrTimeout) {
-		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID})
+		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
 		return err
 	}
-	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID})
+	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
 	return err
 }
 

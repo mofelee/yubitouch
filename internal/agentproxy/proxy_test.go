@@ -636,6 +636,40 @@ func TestUserCancellationClosesBackendAndNextRequestReconnects(t *testing.T) {
 	}
 }
 
+type requesterRecorder struct {
+	events chan signing.Event
+}
+
+func (r requesterRecorder) Handle(event signing.Event) {
+	r.events <- event
+}
+
+func TestConnectionAgentPublishesCapturedRequester(t *testing.T) {
+	target := newPublicKey(t)
+	events := make(chan signing.Event, 3)
+	requester := signing.Requester{Name: "DebianForm", DirectClient: "ssh"}
+	a := &connectionAgent{
+		ctx:       context.Background(),
+		target:    target,
+		comment:   "YubiTouch PIV 9A",
+		requester: requester,
+		backendFactory: func(context.Context) (Backend, error) {
+			return &fakeBackend{}, nil
+		},
+		coordinator: signing.New(nil, requesterRecorder{events: events}, time.Second),
+	}
+	defer a.close()
+	if _, err := a.Sign(target, []byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		event := <-events
+		if event.Requester != requester {
+			t.Fatalf("event requester = %+v, want %+v", event.Requester, requester)
+		}
+	}
+}
+
 func TestListenSecuresAndRemovesSocket(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "yt-agent-")
 	if err != nil {

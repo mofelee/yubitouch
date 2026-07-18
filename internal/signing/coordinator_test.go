@@ -97,6 +97,80 @@ func TestCoordinatorPublishesLifecycle(t *testing.T) {
 	}
 }
 
+func TestCoordinatorKeepsRequesterSnapshotAcrossLifecycle(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(nil, recorder, time.Second)
+	requester := Requester{
+		Name:             "Terminal",
+		DirectClient:     "ssh",
+		BundleIdentifier: "com.apple.Terminal",
+		VerifiedBundle:   true,
+	}
+	_, err := coordinator.SignFor(context.Background(), requester, func() (*ssh.Signature, error) {
+		return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.events) != 3 {
+		t.Fatalf("events = %+v", recorder.events)
+	}
+	requestID := recorder.events[0].RequestID
+	for _, event := range recorder.events {
+		if event.RequestID != requestID || event.Requester != requester {
+			t.Fatalf("event identity changed: %+v", event)
+		}
+	}
+}
+
+func TestQueuedRequestsDoNotMixRequesterSnapshots(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(nil, recorder, time.Second)
+	firstRequester := Requester{Name: "Terminal", DirectClient: "ssh"}
+	secondRequester := Requester{Name: "DebianForm", DirectClient: "ssh"}
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.SignFor(context.Background(), firstRequester, func() (*ssh.Signature, error) {
+			close(firstStarted)
+			<-firstRelease
+			return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+		})
+		firstResult <- err
+	}()
+	<-firstStarted
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.SignFor(context.Background(), secondRequester, func() (*ssh.Signature, error) {
+			return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+		})
+		secondResult <- err
+	}()
+	close(firstRelease)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	byRequest := make(map[uint64]Requester)
+	for _, event := range recorder.events {
+		if existing, ok := byRequest[event.RequestID]; ok && existing != event.Requester {
+			t.Fatalf("request %d mixed requester snapshots: %+v then %+v", event.RequestID, existing, event.Requester)
+		}
+		byRequest[event.RequestID] = event.Requester
+	}
+	if len(byRequest) != 2 {
+		t.Fatalf("request identities = %+v", byRequest)
+	}
+}
+
 func TestCoordinatorPublishesNormalizedSignFailure(t *testing.T) {
 	recorder := &eventRecorder{}
 	coordinator := New(normalizingInitializer{normalized: ErrDeviceUnavailable}, recorder, time.Second)

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/signing"
@@ -24,18 +25,37 @@ func (a *App) SetCancelHandler(handler func(uint64) bool) {
 }
 
 func (a *App) Handle(event signing.Event) {
+	name := requesterName(event.Requester)
 	switch event.Type {
 	case signing.EventWaiting:
-		macos.ShowWaiting(a.sound, event.RequestID)
+		macos.ShowWaiting(a.sound, name+" 正在请求 SSH 签名", waitingSubtitle(event.Requester), event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventSuccess:
-		macos.ShowSuccess(event.RequestID)
+		macos.ShowSuccess(name+" 的请求已授权", event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventTimeout:
-		macos.ShowFailure("签名等待超时，请重试", event.RequestID)
+		macos.ShowFailure(name+" 的请求超时", "签名等待超时，请重试", event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventCanceled:
 		macos.Hide(event.RequestID)
 	case signing.EventFailure:
-		macos.ShowFailure(signFailureMessage(event.Err), event.RequestID)
+		macos.ShowFailure(name+" 的请求失败", signFailureMessage(event.Err), event.Requester.BundleIdentifier, event.RequestID)
 	}
+}
+
+func requesterName(requester signing.Requester) string {
+	if name := strings.TrimSpace(requester.Name); name != "" {
+		return name
+	}
+	if direct := strings.TrimSpace(requester.DirectClient); direct != "" {
+		return direct
+	}
+	return "未知程序"
+}
+
+func waitingSubtitle(requester signing.Requester) string {
+	direct := strings.TrimSpace(requester.DirectClient)
+	if direct == "" || strings.EqualFold(direct, requesterName(requester)) {
+		return "请触摸 YubiKey"
+	}
+	return "请触摸 YubiKey · 直接客户端 " + direct
 }
 
 func signFailureMessage(err error) string {
