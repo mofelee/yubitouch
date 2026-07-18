@@ -18,7 +18,9 @@ checkout 构建。下面是从一把未配置的 YubiKey 到首次 SSH 登录的
 
 要求 macOS 13 或更高版本、YubiKey 5.7 或更高固件、Go 1.25 或更高版本，以及 Xcode
 Command Line Tools。PIV 的 ED25519 支持从 YubiKey 5.7 开始，OpenSSH 的 ED25519
-PKCS#11 支持从 10.1 开始。
+PKCS#11 支持从 10.1 开始。这里安装的 Homebrew OpenSSH 是 YubiTouch 后端
+`ssh-agent`、`ssh-add` 和 `ssh-keygen -D` 的依赖，不要求把日常使用的 SSH 客户端换成
+Homebrew 版本。
 
 ```sh
 xcode-select -p
@@ -29,6 +31,11 @@ ykman --version
 ```
 
 如果 `xcode-select -p` 失败，先运行 `xcode-select --install` 并完成 Apple 的安装界面。
+
+普通连接可以继续使用 macOS 自带的 `/usr/bin/ssh`，无需调整 `PATH` 中 `ssh` 的优先级；
+Apple OpenSSH 10.3p1 已完成真实签名登录验证。YubiTouch 会根据配置直接定位 Homebrew
+后端工具。以后 Apple 更新系统 OpenSSH 时，仍建议先运行 `yubitouch test-sign` 和一次真实
+SSH 登录再确认兼容性。
 
 1Password 模式还需要 1Password 桌面应用。在 **Settings > Developer** 中启用
 **Integrate with other apps**，并按需启用 Touch ID。YubiTouch 使用 1Password Go SDK，
@@ -223,6 +230,9 @@ Host example-yubikey
 
 之后直接运行 `ssh example-yubikey`。首次建立连接会请求 PIN 或 1Password 授权，并显示
 YubiKey 触摸提示；复用已有 `ControlMaster` 连接时不会产生新签名，因此没有 UI。
+
+下面的 `ssh` 可以是 macOS 自带的 `/usr/bin/ssh`，也可以是 Homebrew OpenSSH；只有
+YubiTouch 管理的后端固定使用 Homebrew OpenSSH。
 
 检查 OpenSSH 最终采用的配置并连接：
 
