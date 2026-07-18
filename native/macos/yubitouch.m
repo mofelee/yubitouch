@@ -4,6 +4,7 @@
 #include <string.h>
 
 static NSPanel *YTPanel;
+static NSView *YTContentView;
 static NSImageView *YTIconView;
 static NSTextField *YTTitleLabel;
 static NSTextField *YTSubtitleLabel;
@@ -11,6 +12,18 @@ static NSButton *YTCancelButton;
 static atomic_ullong YTCancelRequestID;
 static unsigned long long YTCurrentRequestID;
 static unsigned long long YTGeneration;
+
+static void YTUpdatePanelAppearance(void);
+
+@interface YTPanelContentView : NSView
+@end
+
+@implementation YTPanelContentView
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    YTUpdatePanelAppearance();
+}
+@end
 
 @interface YTCancelTarget : NSObject
 - (void)cancelSigning:(id)sender;
@@ -56,6 +69,37 @@ static NSTextField *YTLabel(NSRect frame, CGFloat size, NSFontWeight weight, NSC
     return label;
 }
 
+static NSAppearance *YTEffectiveAppearance(void) {
+    NSAppearance *appearance = YTContentView.effectiveAppearance;
+    if (appearance == nil) {
+        appearance = YTPanel.effectiveAppearance;
+    }
+    if (appearance == nil) {
+        appearance = NSApp.effectiveAppearance;
+    }
+    return appearance;
+}
+
+static void YTUpdatePanelAppearance(void) {
+    if (YTContentView == nil) {
+        return;
+    }
+    // Dynamic NSColor behavior is lost when converted to CGColor, so resolve it again whenever appearance changes.
+    dispatch_block_t update = ^{
+        YTContentView.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+        YTContentView.layer.borderColor = NSColor.separatorColor.CGColor;
+        YTTitleLabel.textColor = NSColor.labelColor;
+        YTSubtitleLabel.textColor = NSColor.secondaryLabelColor;
+        YTCancelButton.contentTintColor = NSColor.labelColor;
+    };
+    NSAppearance *appearance = YTEffectiveAppearance();
+    if (appearance == nil) {
+        update();
+    } else {
+        [appearance performAsCurrentDrawingAppearance:update];
+    }
+}
+
 static void YTBuildPanel(void) {
     if (YTPanel != nil) {
         return;
@@ -75,12 +119,11 @@ static void YTBuildPanel(void) {
                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
                                  NSWindowCollectionBehaviorTransient;
 
-    NSView *content = [[NSView alloc] initWithFrame:frame];
+    YTPanelContentView *content = [[YTPanelContentView alloc] initWithFrame:frame];
     content.wantsLayer = YES;
     content.layer.cornerRadius = 8.0;
-    content.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
-    content.layer.borderColor = NSColor.separatorColor.CGColor;
     content.layer.borderWidth = 1.0;
+    YTContentView = content;
     YTPanel.contentView = content;
 
     YTIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 28, 48, 48)];
@@ -104,6 +147,7 @@ static void YTBuildPanel(void) {
     YTCancelButton.accessibilityLabel = @"取消签名";
     YTCancelButton.hidden = YES;
     [content addSubview:YTCancelButton];
+    YTUpdatePanelAppearance();
 }
 
 static void YTPositionPanel(void) {
@@ -127,6 +171,7 @@ static NSImage *YTSymbol(NSString *name, NSColor *color) {
 
 static void YTShow(NSString *symbol, NSColor *color, NSString *title, NSString *subtitle) {
     YTBuildPanel();
+    YTUpdatePanelAppearance();
     YTGeneration++;
     YTIconView.image = YTSymbol(symbol, color);
     YTTitleLabel.stringValue = title;
