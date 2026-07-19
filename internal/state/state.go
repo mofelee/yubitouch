@@ -9,18 +9,41 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/agentroute"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/signing"
 )
 
 type State struct {
-	PID              int       `json:"pid"`
-	StartedAt        time.Time `json:"started_at"`
-	ProviderState    string    `json:"provider_state"`
-	LastSignEvent    string    `json:"last_sign_event,omitempty"`
-	LastSignAt       time.Time `json:"last_sign_at,omitempty"`
-	LastFailureClass string    `json:"last_failure_class,omitempty"`
+	PID               int       `json:"pid"`
+	StartedAt         time.Time `json:"started_at"`
+	ProviderState     string    `json:"provider_state"`
+	LastSignEvent     string    `json:"last_sign_event,omitempty"`
+	LastSignAt        time.Time `json:"last_sign_at,omitempty"`
+	LastFailureClass  string    `json:"last_failure_class,omitempty"`
+	AgentRoute        string    `json:"agent_route,omitempty"`
+	RouteProbeState   string    `json:"route_probe_state,omitempty"`
+	RouteChangedAt    time.Time `json:"route_changed_at,omitempty"`
+	RouteUpdatedAt    time.Time `json:"route_updated_at,omitempty"`
+	FallbackChecked   bool      `json:"fallback_checked"`
+	FallbackReachable bool      `json:"fallback_agent_reachable"`
+	FallbackKeyFound  bool      `json:"fallback_key_available"`
+	FallbackOtherKeys int       `json:"fallback_other_keys"`
+}
+
+func (s *Store) SetRoute(snapshot agentroute.Snapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.AgentRoute = string(snapshot.Route)
+	s.data.RouteProbeState = string(snapshot.ProbeState)
+	s.data.RouteChangedAt = snapshot.ChangedAt
+	s.data.RouteUpdatedAt = snapshot.UpdatedAt
+	s.data.FallbackChecked = snapshot.FallbackChecked
+	s.data.FallbackReachable = snapshot.FallbackReachable
+	s.data.FallbackKeyFound = snapshot.FallbackKeyFound
+	s.data.FallbackOtherKeys = snapshot.FallbackOtherKeys
+	_ = s.writeLocked()
 }
 
 type Store struct {

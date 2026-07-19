@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/agentroute"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/state"
@@ -67,8 +68,18 @@ func TestDaemonRecoversPublicSocketAfterCrash(t *testing.T) {
 	assertDaemonStatePID(t, configPath, firstPID)
 	first.killAndWait(t)
 
-	if info, err := os.Lstat(cfg.SocketPath); err != nil || info.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("crash did not leave a stale public socket: info=%v err=%v", info, err)
+	if info, err := os.Lstat(cfg.SocketPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("crash did not leave the managed public route: info=%v err=%v", info, err)
+	}
+	target, err := os.Readlink(cfg.SocketPath)
+	if err != nil {
+		t.Fatalf("read public route target: %v", err)
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(cfg.SocketPath), target)
+	}
+	if filepath.Clean(target) != filepath.Clean(cfg.PIVSocketPath) {
+		t.Fatalf("public route target = %q, want %q", target, cfg.PIVSocketPath)
 	}
 	assertDaemonStatePID(t, configPath, firstPID)
 
@@ -216,6 +227,7 @@ func writeDaemonTestConfig(t *testing.T, home string) (string, config.Config) {
 	cfg.OpenSSHPrefix = prefix
 	cfg.YKCS11Path = providerPath
 	cfg.SocketPath = filepath.Join(home, "agent.sock")
+	cfg.PIVSocketPath = filepath.Join(home, "piv-agent.sock")
 	cfg.BackendSocketPath = filepath.Join(home, "backend.sock")
 	if err := cfg.ResolveAndValidate(home); err != nil {
 		t.Fatal(err)
@@ -225,4 +237,113 @@ func writeDaemonTestConfig(t *testing.T, home string) (string, config.Config) {
 		t.Fatal(err)
 	}
 	return configPath, cfg
+}
+
+func TestShutdownServicesWaitsBeforeFailClosedAndListenerClose(t *testing.T) {
+	var order []string
+	results := make(chan error, 2)
+	router := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		<-ctx.Done()
+		order = append(order, "router_stopped")
+		return nil
+	})
+	server := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		<-ctx.Done()
+		order = append(order, "server_stopped")
+		return nil
+	})
+
+	err := shutdownServices(
+		router,
+		func() error {
+			order = append(order, "route_fail_closed")
+			return nil
+		},
+		server,
+		func() error {
+			order = append(order, "listener_closed")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"router_stopped", "route_fail_closed", "server_stopped", "listener_closed"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("shutdown order = %v, want %v", order, want)
+	}
+}
+
+func TestDaemonFailClosesGuardBeforeLoadingInvalidConfig(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "yt-daemon-guard-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	configPath, cfg := writeDaemonTestConfig(t, dir)
+	cfg.FallbackAgent = config.FallbackAgent1Password
+	cfg.FallbackAgentSocket = filepath.Join(dir, "fallback.sock")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	pivListener := listenDaemonTestSocket(t, cfg.PIVSocketPath)
+	defer pivListener.Close()
+	fallbackListener := listenDaemonTestSocket(t, cfg.FallbackAgentSocket)
+	defer fallbackListener.Close()
+
+	router := agentroute.New(cfg, agentroute.Options{
+		Probe: func(context.Context) (int, error) { return 0, nil },
+		InspectFallback: func(context.Context, config.Config) (agentroute.FallbackReport, error) {
+			return agentroute.FallbackReport{Reachable: true, TargetKeyFound: true}, nil
+		},
+		DebounceCount: 1,
+		PollInterval:  5 * time.Millisecond,
+		GuardPath:     agentroute.GuardPath(configPath),
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	routerCtx, cancelRouter := context.WithCancel(context.Background())
+	routerDone := make(chan error, 1)
+	go func() { routerDone <- router.Run(routerCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for router.Current().Route != agentroute.Route1Password && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if router.Current().Route != agentroute.Route1Password {
+		cancelRouter()
+		t.Fatalf("router did not enter fallback: %+v", router.Current())
+	}
+	cancelRouter()
+	if err := <-routerDone; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(configPath, []byte("{invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Run(context.Background(), Options{ConfigPath: configPath, Home: dir, Executable: "/bin/false"})
+	if err == nil {
+		t.Fatal("daemon accepted invalid configuration")
+	}
+	report, routeErr := agentroute.InspectPublicRoute(cfg)
+	if routeErr != nil || report.Route != agentroute.RoutePIV || !report.TargetReachable {
+		t.Fatalf("guard did not fail close before config load: report=%+v error=%v", report, routeErr)
+	}
+}
+
+func listenDaemonTestSocket(t *testing.T, path string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	return listener
 }

@@ -3,16 +3,23 @@ package command
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/state"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const testPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG2Lg3xFnLvrY1W8yZOQ1q0+toWPZyV4lX5JUKbVwS3p test\n"
@@ -26,6 +33,7 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 	values := map[string]string{
 		"YUBITOUCH_PUBLIC_KEY":     keyPath,
 		"YUBITOUCH_SOCKET":         filepath.Join("/tmp", "yt-command-test-agent.sock"),
+		"YUBITOUCH_PIV_SOCKET":     filepath.Join("/tmp", "yt-command-test-piv.sock"),
 		"YUBITOUCH_BACKEND_SOCKET": filepath.Join("/tmp", "yt-command-test-backend.sock"),
 	}
 	env := Environment{
@@ -155,11 +163,18 @@ func TestLastSignFailureClassAcceptsCanceledState(t *testing.T) {
 
 func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	signAt := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	routeAt := signAt.Add(-time.Minute)
 	persisted := state.State{
-		PID:           4242,
-		ProviderState: "loaded",
-		LastSignEvent: "success",
-		LastSignAt:    signAt,
+		PID:               4242,
+		ProviderState:     "loaded",
+		LastSignEvent:     "success",
+		LastSignAt:        signAt,
+		AgentRoute:        "1password",
+		RouteProbeState:   "not_detected",
+		RouteChangedAt:    routeAt,
+		FallbackChecked:   true,
+		FallbackReachable: true,
+		FallbackKeyFound:  true,
 	}
 	stale := Status{ProviderState: "not_loaded"}
 	mergePersistedState(&stale, persisted, false)
@@ -169,12 +184,259 @@ func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	if stale.LastSignEvent != "success" || stale.LastSignAt != signAt.Format(time.RFC3339) {
 		t.Fatalf("stale history was not retained: %+v", stale)
 	}
+	if stale.AgentRoute != "" || stale.RouteProbeState != "" || stale.FallbackChecked || stale.FallbackReachable || stale.FallbackKeyFound {
+		t.Fatalf("stale route metadata was presented as current: %+v", stale)
+	}
 
 	current := Status{ProviderState: "not_loaded"}
 	mergePersistedState(&current, persisted, true)
 	if current.StateStale || current.DaemonPID != 4242 || current.ProviderState != "loaded" {
 		t.Fatalf("current status = %+v", current)
 	}
+	if current.AgentRoute != "1password" || current.RouteProbeState != "not_detected" ||
+		current.RouteChangedAt != routeAt.Format(time.RFC3339) || !current.FallbackChecked || !current.FallbackReachable || !current.FallbackKeyFound {
+		t.Fatalf("current route status = %+v", current)
+	}
+}
+
+func TestPersistedRouteMatchesPhysicalTarget(t *testing.T) {
+	tests := []struct {
+		persisted string
+		physical  agentroute.Route
+		want      bool
+	}{
+		{persisted: "piv", physical: agentroute.RoutePIV, want: true},
+		{persisted: "piv_fail_closed", physical: agentroute.RoutePIV, want: true},
+		{persisted: "1password", physical: agentroute.Route1Password, want: true},
+		{persisted: "1password", physical: agentroute.RoutePIV, want: false},
+		{persisted: "piv", physical: agentroute.Route1Password, want: false},
+		{persisted: "", physical: agentroute.RoutePIV, want: false},
+	}
+	for _, test := range tests {
+		if got := persistedRouteMatches(test.persisted, test.physical); got != test.want {
+			t.Fatalf("persistedRouteMatches(%q, %q) = %v, want %v", test.persisted, test.physical, got, test.want)
+		}
+	}
+}
+
+func TestFallbackRouteContradictsConnectedOrUnknownDeviceState(t *testing.T) {
+	if !routeContradictsProbe(agentroute.Route1Password, yubiKeyConnected) ||
+		!routeContradictsProbe(agentroute.Route1Password, yubiKeyProbeUnavailable) {
+		t.Fatal("unsafe fallback route was not marked contradictory")
+	}
+	if routeContradictsProbe(agentroute.Route1Password, yubiKeyNotDetected) ||
+		routeContradictsProbe(agentroute.RoutePIV, yubiKeyConnected) {
+		t.Fatal("safe route state was marked contradictory")
+	}
+}
+
+func TestStatusKeepsPhysicalRouteWhenPersistedRouteMismatches(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-status-route-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	runtimeDir := filepath.Join(home, ".ssh", "yubitouch")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults(home)
+	cfg.PublicKeyPath = keyPath
+	cfg.FallbackAgent = config.FallbackAgent1Password
+	cfg.FallbackAgentSocket = filepath.Join(runtimeDir, "fallback.sock")
+	if err := cfg.ResolveAndValidate(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(config.DefaultPath(home), cfg); err != nil {
+		t.Fatal(err)
+	}
+	pivListener := listenStatusSocket(t, cfg.PIVSocketPath)
+	defer pivListener.Close()
+	router := agentroute.New(cfg, agentroute.Options{
+		Probe:     func(context.Context) (int, error) { return 1, nil },
+		GuardPath: agentroute.GuardPath(config.DefaultPath(home)),
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(runtimeDir, "state.json"))
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store.SetRoute(agentroute.Snapshot{
+		Route:      agentroute.Route1Password,
+		ProbeState: agentroute.ProbeNotDetected,
+		ChangedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	})
+
+	env := Environment{
+		Home:   home,
+		Getenv: func(string) string { return "" },
+		ProbeYubiKeys: func(context.Context) (int, error) {
+			return 1, nil
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runStatus(&stdout, &stderr, env, true); code != ExitOK {
+		t.Fatalf("status exit %d: %s", code, stderr.String())
+	}
+	var got Status
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentRoute != string(agentroute.RoutePIV) || !got.RouteGuardReady || !got.RouteStateStale || !got.StateStale || got.DaemonPID != 0 {
+		t.Fatalf("mismatched route status = %+v", got)
+	}
+}
+
+func listenStatusSocket(t *testing.T, path string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = connection.Close()
+		}
+	}()
+	return listener
+}
+
+func TestContainsTargetKeyAllowsOtherListedIdentities(t *testing.T) {
+	target, _, _, _, err := ssh.ParseAuthorizedKey([]byte(testPublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []*agent.Key{
+		{Format: ssh.KeyAlgoED25519, Blob: []byte("not-the-target")},
+		{Format: target.Type(), Blob: target.Marshal()},
+	}
+	if !containsTargetKey(keys, target.Marshal()) {
+		t.Fatal("target key was not found among multiple identities")
+	}
+	if containsTargetKey(keys[:1], target.Marshal()) {
+		t.Fatal("non-target identity matched")
+	}
+}
+
+func TestSignAllowsMissingDeviceOnDirectFallbackRoute(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-test-sign-fallback-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	runtimeDir := filepath.Join(home, ".ssh", "yubitouch")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, ssh.MarshalAuthorizedKey(publicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults(home)
+	cfg.PublicKeyPath = keyPath
+	cfg.FallbackAgent = config.FallbackAgent1Password
+	cfg.FallbackAgentSocket = filepath.Join(runtimeDir, "fallback.sock")
+	if err := cfg.ResolveAndValidate(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(config.DefaultPath(home), cfg); err != nil {
+		t.Fatal(err)
+	}
+	pivListener := listenStatusSocket(t, cfg.PIVSocketPath)
+	defer pivListener.Close()
+	fallbackListener := serveCommandAgent(t, cfg.FallbackAgentSocket, private)
+	defer fallbackListener.Close()
+	router := agentroute.New(cfg, agentroute.Options{
+		Probe: func(context.Context) (int, error) { return 0, nil },
+		InspectFallback: func(context.Context, config.Config) (agentroute.FallbackReport, error) {
+			return agentroute.FallbackReport{Reachable: true, TargetKeyFound: true}, nil
+		},
+		DebounceCount: 1,
+		PollInterval:  5 * time.Millisecond,
+		GuardPath:     agentroute.GuardPath(config.DefaultPath(home)),
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	routerCtx, cancelRouter := context.WithCancel(context.Background())
+	routerDone := make(chan error, 1)
+	go func() { routerDone <- router.Run(routerCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for router.Current().Route != agentroute.Route1Password && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancelRouter()
+	if err := <-routerDone; err != nil {
+		t.Fatal(err)
+	}
+	if router.Current().Route != agentroute.Route1Password {
+		t.Fatalf("router did not enter fallback: %+v", router.Current())
+	}
+	env := Environment{
+		Home:   home,
+		Getenv: func(string) string { return "" },
+		ProbeYubiKeys: func(context.Context) (int, error) {
+			return 0, nil
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runTestSign(&stdout, &stderr, env); code != ExitOK {
+		t.Fatalf("test-sign exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "succeeded") {
+		t.Fatalf("test-sign output = %q", stdout.String())
+	}
+}
+
+func serveCommandAgent(t *testing.T, path string, privateKey any) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: privateKey}); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = agent.ServeAgent(keyring, conn)
+			}(connection)
+		}
+	}()
+	return listener
 }
 
 func TestProcessAliveRecognizesCurrentProcess(t *testing.T) {

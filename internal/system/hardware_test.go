@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/mofelee/yubitouch/internal/config"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -66,6 +67,15 @@ func TestProbeYubiKeysClassifiesUnavailableToolAndProbeFailure(t *testing.T) {
 	})
 	if !errors.Is(err, ErrDeviceProbe) {
 		t.Fatalf("stderr-only probe error = %v", err)
+	}
+}
+
+func TestInspectHardwareClassifiesMissingDevice(t *testing.T) {
+	report, err := inspectHardware(context.Background(), config.Config{}, Dependencies{}, func(context.Context) (int, error) {
+		return 0, nil
+	})
+	if !errors.Is(err, ErrDeviceNotDetected) || report.DeviceCount != 0 {
+		t.Fatalf("report=%+v error=%v", report, err)
 	}
 }
 

@@ -40,6 +40,9 @@ const (
 	EventSignFailed       Event = "sign_failed"
 	EventSignTimedOut     Event = "sign_timed_out"
 	EventSignCanceled     Event = "sign_canceled"
+	EventRoutePIV         Event = "agent_route_piv"
+	EventRoute1Password   Event = "agent_route_1password"
+	EventRouteFailClosed  Event = "agent_route_piv_fail_closed"
 	EventLogReset         Event = "log_size_limit_reached"
 )
 
@@ -208,6 +211,9 @@ func validEvent(event Event) bool {
 		EventSignFailed,
 		EventSignTimedOut,
 		EventSignCanceled,
+		EventRoutePIV,
+		EventRoute1Password,
+		EventRouteFailClosed,
 		EventLogReset:
 		return true
 	default:

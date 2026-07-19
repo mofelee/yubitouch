@@ -33,6 +33,7 @@ func TestLoadForConfigureAndSave(t *testing.T) {
 		"YUBITOUCH_1PASSWORD_REF":     "op://Personal/YubiKey/pin",
 		"YUBITOUCH_SIGN_TIMEOUT":      "15s",
 		"YUBITOUCH_SOCKET":            filepath.Join("/tmp", "yt-config-test-agent.sock"),
+		"YUBITOUCH_PIV_SOCKET":        filepath.Join("/tmp", "yt-config-test-piv.sock"),
 		"YUBITOUCH_BACKEND_SOCKET":    filepath.Join("/tmp", "yt-config-test-backend.sock"),
 		"YUBITOUCH_YKCS11":            providerLink,
 	}
@@ -149,5 +150,126 @@ func TestDefaultsKeepStableProviderPath(t *testing.T) {
 	path := Defaults(t.TempDir()).YKCS11Path
 	if strings.Contains(path, string(filepath.Separator)+"Cellar"+string(filepath.Separator)) {
 		t.Fatalf("default provider path is versioned: %s", path)
+	}
+}
+
+func TestDefaultsUseSeparatePIVRouteAndDisableFallback(t *testing.T) {
+	home := t.TempDir()
+	cfg := Defaults(home)
+	if cfg.FallbackAgent != FallbackAgentNone || cfg.FallbackAgentSocket != "" {
+		t.Fatalf("fallback defaults = %q %q", cfg.FallbackAgent, cfg.FallbackAgentSocket)
+	}
+	if cfg.SocketPath == cfg.PIVSocketPath || cfg.SocketPath == cfg.BackendSocketPath || cfg.PIVSocketPath == cfg.BackendSocketPath {
+		t.Fatalf("managed sockets are not distinct: %+v", cfg)
+	}
+	if got := filepath.Base(cfg.PIVSocketPath); got != "piv-agent.sock" {
+		t.Fatalf("PIV socket basename = %q", got)
+	}
+}
+
+func TestLoadMigratesConfigWithoutPIVSocket(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-config-migrate-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	runtimeDir := filepath.Join(home, ".ssh", "yubitouch")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(runtimeDir, "config.json")
+	legacy := `{
+  "pin_provider": "prompt",
+  "public_key": "` + keyPath + `",
+  "ykcs11": "/tmp/libykcs11.dylib",
+  "openssh_prefix": "/tmp/openssh",
+  "socket": "/tmp/yubitouch-legacy-agent.sock",
+  "backend_socket": "/tmp/yubitouch-legacy-backend.sock",
+  "fallback_agent": "1password",
+  "fallback_agent_socket": "/tmp/yubitouch-legacy-1password.sock",
+  "sound": "Glass",
+  "sign_timeout": "60s",
+  "log_level": "info"
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(runtimeDir, "piv-agent.sock")
+	if cfg.PIVSocketPath != want {
+		t.Fatalf("migrated PIV socket = %q, want %q", cfg.PIVSocketPath, want)
+	}
+	if cfg.FallbackAgent != FallbackAgent1Password || cfg.FallbackAgentSocket != "/tmp/yubitouch-legacy-1password.sock" {
+		t.Fatalf("legacy fallback was not retained: %q %q", cfg.FallbackAgent, cfg.FallbackAgentSocket)
+	}
+}
+
+func TestFallbackEnvironmentEnablesAndDisablesWithoutLosingManagedTarget(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-config-fallback-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		"YUBITOUCH_PUBLIC_KEY":     keyPath,
+		"YUBITOUCH_SOCKET":         "/tmp/yubitouch-fallback-public.sock",
+		"YUBITOUCH_PIV_SOCKET":     "/tmp/yubitouch-fallback-piv.sock",
+		"YUBITOUCH_BACKEND_SOCKET": "/tmp/yubitouch-fallback-backend.sock",
+		"YUBITOUCH_FALLBACK_AGENT": "1password",
+	}
+	cfg, err := LoadForConfigure(DefaultPath(home), home, func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackAgent != FallbackAgent1Password || cfg.FallbackAgentSocket != defaultOnePasswordAgentSocket(home) {
+		t.Fatalf("enabled fallback = %q %q", cfg.FallbackAgent, cfg.FallbackAgentSocket)
+	}
+	if err := Save(DefaultPath(home), cfg); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := LoadForConfigure(DefaultPath(home), home, func(name string) string {
+		if name == "YUBITOUCH_FALLBACK_AGENT" {
+			return "off"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.FallbackAgent != FallbackAgentNone || disabled.FallbackAgentSocket != cfg.FallbackAgentSocket {
+		t.Fatalf("disabled fallback = %q %q", disabled.FallbackAgent, disabled.FallbackAgentSocket)
+	}
+}
+
+func TestResolveRejectsOverlappingManagedSockets(t *testing.T) {
+	home := t.TempDir()
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Defaults(home)
+	cfg.PublicKeyPath = keyPath
+	cfg.PIVSocketPath = cfg.SocketPath
+	if err := cfg.ResolveAndValidate(home); err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("overlapping sockets error = %v", err)
+	}
+
+	cfg = Defaults(home)
+	cfg.PublicKeyPath = keyPath
+	cfg.FallbackAgent = FallbackAgent1Password
+	cfg.FallbackAgentSocket = cfg.BackendSocketPath
+	if err := cfg.ResolveAndValidate(home); err == nil || !strings.Contains(err.Error(), "fallback_agent_socket") {
+		t.Fatalf("fallback overlap error = %v", err)
 	}
 }
