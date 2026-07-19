@@ -10,9 +10,18 @@ import (
 )
 
 var (
-	ErrCanceled          = errors.New("sign request canceled")
-	ErrTimeout           = errors.New("sign request timed out")
-	ErrDeviceUnavailable = errors.New("YubiKey became unavailable during signing")
+	ErrCanceled               = errors.New("sign request canceled")
+	ErrTimeout                = errors.New("sign request timed out")
+	ErrDeviceUnavailable      = errors.New("YubiKey became unavailable during signing")
+	ErrFallbackUnavailable    = errors.New("1Password fallback agent is unavailable")
+	ErrFallbackKeyUnavailable = errors.New("1Password fallback agent does not contain the configured target key")
+)
+
+type Signer string
+
+const (
+	SignerYubiKey   Signer = "yubikey"
+	Signer1Password Signer = "1password"
 )
 
 type EventType string
@@ -32,6 +41,7 @@ type Event struct {
 	Err       error
 	RequestID uint64
 	Requester Requester
+	Signer    Signer
 }
 
 type Sink interface {
@@ -50,6 +60,10 @@ type SignFailureNormalizer interface {
 	NormalizeSignFailure(context.Context, error) error
 }
 
+type SignerProvider interface {
+	CurrentSigner() Signer
+}
+
 type InitializerFunc func(context.Context) error
 
 func (f InitializerFunc) Ensure(ctx context.Context) error {
@@ -59,6 +73,7 @@ func (f InitializerFunc) Ensure(ctx context.Context) error {
 type Result struct {
 	Signature *ssh.Signature
 	Err       error
+	Signer    Signer
 }
 
 type Coordinator struct {
@@ -106,6 +121,12 @@ func (c *Coordinator) SignFor(ctx context.Context, requester Requester, call fun
 }
 
 func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester, call func() (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
+	return c.SignContextCancelableFor(ctx, requester, func(context.Context) (*ssh.Signature, error) {
+		return call()
+	}, cancelCall)
+}
+
+func (c *Coordinator) SignContextCancelableFor(ctx context.Context, requester Requester, call func(context.Context) (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -137,15 +158,16 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 		defer func() { <-c.semaphore }()
 		c.publish(Event{Type: EventInitializing, At: c.now(), RequestID: activeID, Requester: requester})
 		if err := c.initializer.Ensure(requestCtx); err != nil {
-			result <- Result{Err: err}
+			result <- Result{Err: err, Signer: initializerSigner(c.initializer)}
 			return
 		}
+		signer := initializerSigner(c.initializer)
 		if err := requestCtx.Err(); err != nil {
-			result <- Result{Err: err}
+			result <- Result{Err: err, Signer: signer}
 			return
 		}
-		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID, Requester: requester})
-		sig, err := call()
+		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID, Requester: requester, Signer: signer})
+		sig, err := call(requestCtx)
 		if err != nil {
 			if normalizer, ok := c.initializer.(SignFailureNormalizer); ok {
 				err = normalizer.NormalizeSignFailure(requestCtx, err)
@@ -154,7 +176,7 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 				invalidator.Invalidate()
 			}
 		}
-		result <- Result{Signature: sig, Err: err}
+		result <- Result{Signature: sig, Err: err, Signer: signer}
 	}()
 
 	select {
@@ -163,29 +185,29 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 			if errors.Is(got.Err, context.DeadlineExceeded) {
 				cancelOperation()
 				err := ErrTimeout
-				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID, Requester: requester})
+				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID, Requester: requester, Signer: got.Signer})
 				return nil, err
 			}
 			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return nil, c.finishContext(requestCtx, activeID, requester, got.Signer)
 			}
 			if errors.Is(got.Err, context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return nil, c.finishContext(requestCtx, activeID, requester, got.Signer)
 			}
 			if errors.Is(requestCtx.Err(), context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return nil, c.finishContext(requestCtx, activeID, requester, got.Signer)
 			}
-			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID, Requester: requester})
+			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID, Requester: requester, Signer: got.Signer})
 			return nil, got.Err
 		}
-		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID, Requester: requester})
+		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID, Requester: requester, Signer: got.Signer})
 		return got.Signature, nil
 	case <-requestCtx.Done():
 		cancelOperation()
-		return nil, c.finishContext(requestCtx, activeID, requester)
+		return nil, c.finishContext(requestCtx, activeID, requester, initializerSigner(c.initializer))
 	}
 }
 
@@ -222,14 +244,21 @@ func (c *Coordinator) LastEvent() Event {
 	return c.last
 }
 
-func (c *Coordinator) finishContext(ctx context.Context, requestID uint64, requester Requester) error {
+func (c *Coordinator) finishContext(ctx context.Context, requestID uint64, requester Requester, signer Signer) error {
 	err := contextError(ctx)
 	if errors.Is(err, ErrTimeout) {
-		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
+		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID, Requester: requester, Signer: signer})
 		return err
 	}
-	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
+	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID, Requester: requester, Signer: signer})
 	return err
+}
+
+func initializerSigner(initializer Initializer) Signer {
+	if provider, ok := initializer.(SignerProvider); ok {
+		return provider.CurrentSigner()
+	}
+	return SignerYubiKey
 }
 
 func (c *Coordinator) beginActive(cancel context.CancelFunc) uint64 {

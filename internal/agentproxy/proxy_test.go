@@ -43,6 +43,29 @@ type cancelableBackend struct {
 	stopOnce  sync.Once
 }
 
+type writeSignalConn struct {
+	net.Conn
+	wrote chan struct{}
+	once  sync.Once
+}
+
+type orderedInitializer struct {
+	ready atomic.Bool
+}
+
+func (i *orderedInitializer) Ensure(context.Context) error {
+	i.ready.Store(true)
+	return nil
+}
+
+func (c *writeSignalConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.once.Do(func() { close(c.wrote) })
+	}
+	return n, err
+}
+
 func (b *cancelableBackend) SignWithFlags(ssh.PublicKey, []byte, agent.SignatureFlags) (*ssh.Signature, error) {
 	b.signCount.Add(1)
 	b.startOnce.Do(func() { close(b.started) })
@@ -126,6 +149,25 @@ func TestListDoesNotCreateBackend(t *testing.T) {
 	}
 	if factories.Load() != 0 {
 		t.Fatal("List created a backend connection")
+	}
+}
+
+func TestBackendIsCreatedAfterSigningInitialization(t *testing.T) {
+	initializer := &orderedInitializer{}
+	target := newPublicKey(t)
+	a := &connectionAgent{
+		ctx:    context.Background(),
+		target: target,
+		backendFactory: func(context.Context) (Backend, error) {
+			if !initializer.ready.Load() {
+				t.Fatal("backend was created before signing initialization")
+			}
+			return &fakeBackend{}, nil
+		},
+		coordinator: signing.New(initializer, nil, time.Second),
+	}
+	if _, err := a.Sign(target, []byte("request")); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -424,16 +466,19 @@ func TestClientDisconnectCancelsQueuedSign(t *testing.T) {
 
 	go server.serveConn(ctx, secondServerConn)
 	secondResult := make(chan error, 1)
+	secondRequestWritten := make(chan struct{})
+	secondClient := &writeSignalConn{Conn: secondClientConn, wrote: secondRequestWritten}
 	go func() {
-		_, err := agent.NewClient(secondClientConn).Sign(target, []byte("second request"))
+		_, err := agent.NewClient(secondClient).Sign(target, []byte("second request"))
 		secondResult <- err
 	}()
-	deadline := time.Now().Add(time.Second)
-	for factories.Load() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatal("second request did not reach the signing queue")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-secondRequestWritten:
+	case <-time.After(time.Second):
+		t.Fatal("second request was not written to the agent connection")
+	}
+	if factories.Load() != 1 {
+		t.Fatalf("queued request created %d backends, want only the active backend", factories.Load())
 	}
 	_ = secondClientConn.Close()
 	close(disconnectSecond)
@@ -445,15 +490,9 @@ func TestClientDisconnectCancelsQueuedSign(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("disconnected client did not return")
 	}
-	deadline = time.Now().Add(time.Second)
-	for !second.closed.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("queued backend connection was not closed")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if second.signCount.Load() != 0 {
-		t.Fatalf("queued backend signed %d times", second.signCount.Load())
+	if second.closed.Load() || second.signCount.Load() != 0 || factories.Load() != 1 {
+		t.Fatalf("queued request backend state: factories=%d closed=%v signs=%d",
+			factories.Load(), second.closed.Load(), second.signCount.Load())
 	}
 
 	close(first.release)

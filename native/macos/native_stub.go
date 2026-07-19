@@ -10,7 +10,7 @@ var ErrPromptCanceled = errors.New("PIN prompt was canceled")
 func InitializeApplication() {}
 func RunApplication()        {}
 func StopApplication()       {}
-func ShowWaiting(string, string, string, string, uint64) {
+func ShowWaiting(string, string, string, string, bool, uint64) {
 }
 func ShowSuccess(string, string, uint64) {
 }

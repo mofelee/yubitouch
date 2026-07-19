@@ -24,7 +24,7 @@ func TestRequesterTextKeepsTouchInstructionAndDirectClient(t *testing.T) {
 	if got := requesterName(requester); got != "Terminal" {
 		t.Fatalf("requester name = %q", got)
 	}
-	if got := waitingSubtitle(requester); got != "请触摸 YubiKey · 直接客户端 ssh" {
+	if got := waitingSubtitle(requester, signing.SignerYubiKey); got != "请触摸 YubiKey · 直接客户端 ssh" {
 		t.Fatalf("waiting subtitle = %q", got)
 	}
 }
@@ -33,8 +33,24 @@ func TestRequesterTextUsesStableFallback(t *testing.T) {
 	if got := requesterName(signing.Requester{}); got != "未知程序" {
 		t.Fatalf("requester fallback = %q", got)
 	}
-	if got := waitingSubtitle(signing.Requester{Name: "YubiTouch", DirectClient: "YubiTouch"}); got != "请触摸 YubiKey" {
+	if got := waitingSubtitle(signing.Requester{Name: "YubiTouch", DirectClient: "YubiTouch"}, signing.SignerYubiKey); got != "请触摸 YubiKey" {
 		t.Fatalf("same-client subtitle = %q", got)
+	}
+}
+
+func TestFallbackSubtitleDoesNotRequestYubiKeyTouch(t *testing.T) {
+	got := waitingSubtitle(signing.Requester{Name: "Terminal", DirectClient: "ssh"}, signing.Signer1Password)
+	if got != "YubiKey 未连接 · 使用 1Password" {
+		t.Fatalf("fallback subtitle = %q", got)
+	}
+}
+
+func TestFallbackFailureMessagesAreExplicit(t *testing.T) {
+	if got := signFailureMessage(signing.ErrFallbackUnavailable); got != "1Password fallback 不可用，请解锁并检查 SSH Agent" {
+		t.Fatalf("fallback failure message = %q", got)
+	}
+	if got := signFailureMessage(signing.ErrFallbackKeyUnavailable); got != "1Password 中未找到配置的 SSH key" {
+		t.Fatalf("fallback key message = %q", got)
 	}
 }
 

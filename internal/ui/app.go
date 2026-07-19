@@ -28,7 +28,7 @@ func (a *App) Handle(event signing.Event) {
 	name := requesterName(event.Requester)
 	switch event.Type {
 	case signing.EventWaiting:
-		macos.ShowWaiting(a.sound, name+" 正在请求 SSH 签名", waitingSubtitle(event.Requester), event.Requester.BundleIdentifier, event.RequestID)
+		macos.ShowWaiting(a.sound, name+" 正在请求 SSH 签名", waitingSubtitle(event.Requester, event.Signer), event.Requester.BundleIdentifier, event.Signer == signing.Signer1Password, event.RequestID)
 	case signing.EventSuccess:
 		macos.ShowSuccess(name+" 的请求已授权", event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventTimeout:
@@ -50,7 +50,10 @@ func requesterName(requester signing.Requester) string {
 	return "未知程序"
 }
 
-func waitingSubtitle(requester signing.Requester) string {
+func waitingSubtitle(requester signing.Requester, signer signing.Signer) string {
+	if signer == signing.Signer1Password {
+		return "YubiKey 未连接 · 使用 1Password"
+	}
 	direct := strings.TrimSpace(requester.DirectClient)
 	if direct == "" || strings.EqualFold(direct, requesterName(requester)) {
 		return "请触摸 YubiKey"
@@ -59,6 +62,12 @@ func waitingSubtitle(requester signing.Requester) string {
 }
 
 func signFailureMessage(err error) string {
+	if errors.Is(err, signing.ErrFallbackKeyUnavailable) {
+		return "1Password 中未找到配置的 SSH key"
+	}
+	if errors.Is(err, signing.ErrFallbackUnavailable) {
+		return "1Password fallback 不可用，请解锁并检查 SSH Agent"
+	}
 	if errors.Is(err, signing.ErrDeviceUnavailable) {
 		return "YubiKey 已断开，请重新连接"
 	}

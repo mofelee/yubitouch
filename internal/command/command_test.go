@@ -91,6 +91,8 @@ func TestReportSignFailureMapsSafeExitCodes(t *testing.T) {
 		{failure: "device_unavailable", code: ExitDeviceMissing, message: "reconnect"},
 		{failure: "provider_initialization", code: ExitPINFailure, message: "PIN/provider"},
 		{failure: "key_mismatch", code: ExitKeyMismatch, message: "does not match"},
+		{failure: "fallback_key_unavailable", code: ExitKeyMismatch, message: "not available"},
+		{failure: "fallback_unavailable", code: ExitRuntimeError, message: "fallback agent is unavailable"},
 		{failure: "timeout", code: ExitSignTimeout, message: "timed out"},
 		{failure: "canceled", code: ExitSignTimeout, message: "canceled"},
 		{failure: "op://Personal/YubiKey/PIN=123456", code: ExitRuntimeError, message: "yubitouch.log"},
@@ -160,13 +162,14 @@ func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 		ProviderState: "loaded",
 		LastSignEvent: "success",
 		LastSignAt:    signAt,
+		LastSigner:    string(signing.Signer1Password),
 	}
 	stale := Status{ProviderState: "not_loaded"}
 	mergePersistedState(&stale, persisted, false)
 	if !stale.StateStale || stale.DaemonPID != 0 || stale.ProviderState != "unavailable" {
 		t.Fatalf("stale status = %+v", stale)
 	}
-	if stale.LastSignEvent != "success" || stale.LastSignAt != signAt.Format(time.RFC3339) {
+	if stale.LastSignEvent != "success" || stale.LastSignAt != signAt.Format(time.RFC3339) || stale.LastSigner != string(signing.Signer1Password) {
 		t.Fatalf("stale history was not retained: %+v", stale)
 	}
 

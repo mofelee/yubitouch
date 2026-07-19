@@ -108,6 +108,15 @@ func TestClassifyTypedDeviceUnavailable(t *testing.T) {
 	}
 }
 
+func TestClassifyTypedFallbackFailures(t *testing.T) {
+	if got := Classify(signing.ErrFallbackUnavailable); got != FailureFallbackUnavailable {
+		t.Fatalf("fallback failure class = %q", got)
+	}
+	if got := Classify(signing.ErrFallbackKeyUnavailable); got != FailureFallbackKeyUnavailable {
+		t.Fatalf("fallback key failure class = %q", got)
+	}
+}
+
 func TestLogResetsAtSizeLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "yubitouch.log")
 	logger, err := Open(path, "info")

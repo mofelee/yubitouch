@@ -286,7 +286,7 @@ void YTStopApplication(void) {
     });
 }
 
-void YTShowWaiting(const char *soundName, const char *titleText, const char *subtitleText, const char *bundleIdentifierText, unsigned long long requestID) {
+void YTShowWaiting(const char *soundName, const char *titleText, const char *subtitleText, const char *bundleIdentifierText, int fallback, unsigned long long requestID) {
     NSString *sound = soundName == NULL ? @"" : [NSString stringWithUTF8String:soundName];
     NSString *title = titleText == NULL ? @"未知程序正在请求 SSH 签名" : [NSString stringWithUTF8String:titleText];
     NSString *subtitle = subtitleText == NULL ? @"请触摸 YubiKey" : [NSString stringWithUTF8String:subtitleText];
@@ -294,7 +294,11 @@ void YTShowWaiting(const char *soundName, const char *titleText, const char *sub
     YTOnMain(^{
         YTCurrentRequestID = requestID;
         atomic_store(&YTCancelRequestID, 0);
-        YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, title, subtitle, bundleIdentifier);
+        if (fallback) {
+            YTShow(@"key.fill", NSColor.systemBlueColor, title, subtitle, bundleIdentifier);
+        } else {
+            YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, title, subtitle, bundleIdentifier);
+        }
         YTCancelButton.enabled = YES;
         YTCancelButton.hidden = NO;
         if (sound.length > 0 && ![sound isEqualToString:@"none"]) {

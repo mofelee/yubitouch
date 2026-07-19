@@ -151,3 +151,85 @@ func TestDefaultsKeepStableProviderPath(t *testing.T) {
 		t.Fatalf("default provider path is versioned: %s", path)
 	}
 }
+
+func TestOnePasswordFallbackUsesDefaultSocketAndPersists(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-cfg-fallback-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		"YUBITOUCH_PUBLIC_KEY":     keyPath,
+		"YUBITOUCH_FALLBACK_AGENT": "1password",
+	}
+	cfg, err := LoadForConfigure(DefaultPath(home), home, func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock")
+	if cfg.FallbackAgent != FallbackAgent1Password || cfg.FallbackAgentSocket != want {
+		t.Fatalf("fallback = %q %q, want 1password %q", cfg.FallbackAgent, cfg.FallbackAgentSocket, want)
+	}
+}
+
+func TestFallbackConfigurationRejectsInvalidAndManagedSockets(t *testing.T) {
+	home := t.TempDir()
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := Defaults(home)
+	base.PublicKeyPath = keyPath
+
+	invalid := base
+	invalid.FallbackAgent = "other"
+	if err := invalid.ResolveAndValidate(home); err == nil || !strings.Contains(err.Error(), "invalid fallback_agent") {
+		t.Fatalf("invalid fallback error = %v", err)
+	}
+
+	loop := base
+	loop.FallbackAgent = FallbackAgent1Password
+	loop.FallbackAgentSocket = loop.SocketPath
+	if err := loop.ResolveAndValidate(home); err == nil || !strings.Contains(err.Error(), "different") {
+		t.Fatalf("managed socket fallback error = %v", err)
+	}
+}
+
+func TestFallbackCanBeDisabledFromEnvironment(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "yt-cfg-disable-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	keyPath := filepath.Join(home, "key.pub")
+	if err := os.WriteFile(keyPath, []byte(testPublicKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := DefaultPath(home)
+	cfg := Defaults(home)
+	cfg.PublicKeyPath = keyPath
+	cfg.FallbackAgent = FallbackAgent1Password
+	cfg.FallbackAgentSocket = filepath.Join(home, "fallback.sock")
+	if err := cfg.ResolveAndValidate(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadForConfigure(path, home, func(name string) string {
+		if name == "YUBITOUCH_FALLBACK_AGENT" {
+			return "none"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.FallbackAgent != FallbackAgentNone || loaded.FallbackAgentSocket != "" {
+		t.Fatalf("fallback was not disabled: %+v", loaded)
+	}
+}

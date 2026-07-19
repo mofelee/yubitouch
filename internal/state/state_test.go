@@ -70,3 +70,20 @@ func TestStorePersistsCanceledTerminalState(t *testing.T) {
 		t.Fatalf("canceled state = %+v", loaded)
 	}
 }
+
+func TestFallbackSignerDoesNotClaimPIVProviderLoaded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store.Handle(signing.Event{Type: signing.EventWaiting, At: time.Now(), Signer: signing.Signer1Password})
+	store.Handle(signing.Event{Type: signing.EventSuccess, At: time.Now(), Signer: signing.Signer1Password})
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ProviderState != "not_loaded" || loaded.LastSigner != string(signing.Signer1Password) {
+		t.Fatalf("fallback state = %+v", loaded)
+	}
+}

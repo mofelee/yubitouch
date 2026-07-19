@@ -20,6 +20,13 @@ type normalizingInitializer struct {
 	normalized error
 }
 
+type signerInitializer struct {
+	signer Signer
+}
+
+func (s signerInitializer) Ensure(context.Context) error { return nil }
+func (s signerInitializer) CurrentSigner() Signer        { return s.signer }
+
 func (n normalizingInitializer) Ensure(context.Context) error { return nil }
 func (n normalizingInitializer) NormalizeSignFailure(context.Context, error) error {
 	return n.normalized
@@ -93,6 +100,24 @@ func TestCoordinatorPublishesLifecycle(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestCoordinatorPublishesSelectedSigner(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(signerInitializer{signer: Signer1Password}, recorder, time.Second)
+	_, err := coordinator.Sign(context.Background(), func() (*ssh.Signature, error) {
+		return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	for _, event := range recorder.events {
+		if event.Type != EventInitializing && event.Signer != Signer1Password {
+			t.Fatalf("event signer = %q for %s", event.Signer, event.Type)
 		}
 	}
 }

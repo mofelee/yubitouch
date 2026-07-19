@@ -20,6 +20,7 @@ type State struct {
 	ProviderState    string    `json:"provider_state"`
 	LastSignEvent    string    `json:"last_sign_event,omitempty"`
 	LastSignAt       time.Time `json:"last_sign_at,omitempty"`
+	LastSigner       string    `json:"last_signer,omitempty"`
 	LastFailureClass string    `json:"last_failure_class,omitempty"`
 }
 
@@ -51,14 +52,25 @@ func (s *Store) Handle(event signing.Event) {
 	defer s.mu.Unlock()
 	s.data.LastSignEvent = string(event.Type)
 	s.data.LastSignAt = event.At.UTC()
+	if event.Signer != "" {
+		s.data.LastSigner = string(event.Signer)
+	}
 	s.data.LastFailureClass = ""
 	switch event.Type {
 	case signing.EventInitializing:
 		s.data.ProviderState = "initializing"
 	case signing.EventWaiting, signing.EventSuccess:
-		s.data.ProviderState = "loaded"
+		if event.Signer == signing.Signer1Password {
+			s.data.ProviderState = "not_loaded"
+		} else {
+			s.data.ProviderState = "loaded"
+		}
 	case signing.EventFailure, signing.EventCanceled:
-		s.data.ProviderState = "unavailable"
+		if event.Signer == signing.Signer1Password {
+			s.data.ProviderState = "not_loaded"
+		} else {
+			s.data.ProviderState = "unavailable"
+		}
 		failure := diagnostic.Classify(event.Err)
 		if event.Type == signing.EventCanceled {
 			failure = diagnostic.FailureCanceled
@@ -68,7 +80,11 @@ func (s *Store) Handle(event signing.Event) {
 		}
 		s.data.LastFailureClass = string(failure)
 	case signing.EventTimeout:
-		s.data.ProviderState = "unavailable"
+		if event.Signer == signing.Signer1Password {
+			s.data.ProviderState = "not_loaded"
+		} else {
+			s.data.ProviderState = "unavailable"
+		}
 		s.data.LastFailureClass = string(diagnostic.FailureTimeout)
 	}
 	_ = s.writeLocked()
