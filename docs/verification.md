@@ -126,7 +126,7 @@ yubitouch status --json | jq '{
    签名成功、没有 YubiTouch 触摸浮层，且 `last_sign_at` 不因这次直接签名更新。
 5. 重新插入 YubiKey。下一次成功探测应返回 `piv`；再运行一次 `test-sign`，
    确认走 PIV PIN/触摸链路并更新 `last_sign_at`。
-6. 在 `piv` 和 `1password` 两种路由上分别执行一次真实 session-bind 回合：
+6. 在 `piv` 路由上执行一次真实 session-bind 回合：
 
    ```sh
    YUBITOUCH_LIVE_AGENT_SOCKET="$HOME/.ssh/yubitouch/agent.sock" \
@@ -134,8 +134,12 @@ yubitouch status --json | jq '{
        -run '^TestLiveAgentSessionBindRoundTrip$' -count=1 -v
    ```
 
-   两次都必须实际执行而不是 skip，以验证稳定入口没有吞掉
-   `session-bind@openssh.com`。
+   测试必须实际执行而不是 skip，以验证 PIV Agent 没有吞掉
+   `session-bind@openssh.com`。缺卡路由不经过 YubiTouch Agent；1Password Agent 当前会对
+   直接发送的裸 `session-bind@openssh.com` 返回 `SSH_AGENT_EXTENSION_FAILURE`。因此缺卡
+   验收应比较公开 socket 与 1Password 原始 socket 的响应完全一致，并以真实 OpenSSH
+   新连接成功为准，不能要求这个 PIV 专用回合测试成功。公开 socket 不得代理、吞掉或改写
+   1Password 的扩展响应。
 
 ### ControlMaster 与 ProxyJump
 
