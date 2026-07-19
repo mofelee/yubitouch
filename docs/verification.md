@@ -61,41 +61,6 @@ reference。确认未安装 `op` CLI 时仍可工作，失败时不会回退到 
 取消（上游 #266），因此 1Password 自己拥有的授权窗口可能需要用户手动取消。记录该现象，
 但不得用 UI 自动化代替 SDK 取消能力。
 
-## 1Password SSH Agent fallback
-
-这组测试只适用于 1Password 和 YubiKey 持有同一把私钥的配置。不得把 Agent identity
-列表、公钥内容、指纹、账户名或 socket 的完整用户路径写入验证记录。
-
-1. 启用 1Password SSH Agent 和 YubiTouch fallback，运行 `doctor`，确认目标 key 精确匹配，
-   其他 key 只报告数量并被过滤。
-2. 保持 YubiKey 连接，运行 `test-sign`，确认走 YKCS11/PIV、显示触摸提示且不出现 fallback UI。
-3. 完全移除 YubiKey 后运行 `test-sign`，确认不读取 PIV PIN、不加载 YKCS11，显示
-   “YubiKey 未连接 · 使用 1Password”，并由 1Password 完成签名。
-4. 使用同一公共 Agent socket 验证一次 SSH 新连接和 Git SSH Commit 签名；服务器、GitHub
-   Signing Key 和 Git `user.signingkey` 均不得切换。
-5. 将 fallback socket 临时改为不包含目标 key 的测试 Agent，确认 fail closed 且不会尝试
-   其他 identity；恢复配置后重新 `reload`。
-6. 分别验证 probe 失败、错误 PIN、PIN provider 取消、触摸取消/超时和签名中途拔出，确认
-   全部不会 fallback，也不会产生第二次签名。
-
-| 场景 | 选择的 signer | PIV PIN/YKCS11 | UI | 结果/Issue |
-|---|---|---|---|---|
-| YubiKey 已连接 | yubikey | normal | YubiKey touch | pending |
-| 签名前 `not_detected` | 1password | not used | explicit fallback | pending |
-| probe unavailable | yubikey/fail closed | no fallback | failure | pending |
-| fallback 无目标 key | 1password/fail closed | not used | failure | pending |
-| PIN/取消/超时/中途拔出 | yubikey/fail closed | no retry | failure/canceled | pending |
-
-只读检查真实 1Password Agent 中是否存在目标 key：
-
-```sh
-YUBITOUCH_LIVE_FALLBACK_SOCKET="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock" \
-YUBITOUCH_LIVE_PUBLIC_KEY="$HOME/.ssh/yubikey-piv.pub" \
-go test ./internal/backend -run '^TestLiveFallbackTargetKey$' -count=1 -v
-```
-
-该测试只执行 identity 查询和精确匹配，不发起签名，不应出现 Touch ID 或其他授权 UI。
-
 ## LaunchAgent 与无副作用查询
 
 1. 运行 `yubitouch ensure`，确认 plist 位于

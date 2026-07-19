@@ -14,9 +14,8 @@ import (
 )
 
 var (
-	ErrYKManUnavailable  = errors.New("ykman is not installed")
-	ErrDeviceProbe       = errors.New("cannot query connected YubiKeys")
-	ErrDeviceNotDetected = errors.New("no YubiKey was detected")
+	ErrYKManUnavailable = errors.New("ykman is not installed")
+	ErrDeviceProbe      = errors.New("cannot query connected YubiKeys")
 )
 
 type HardwareReport struct {
@@ -80,7 +79,7 @@ func InspectHardware(ctx context.Context, cfg config.Config, deps Dependencies) 
 	}
 	report := HardwareReport{DeviceCount: deviceCount}
 	if report.DeviceCount == 0 {
-		return report, ErrDeviceNotDetected
+		return report, errors.New("no YubiKey was detected")
 	}
 	ykman, err := exec.LookPath("ykman")
 	if err != nil {

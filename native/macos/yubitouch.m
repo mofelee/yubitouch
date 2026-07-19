@@ -61,14 +61,6 @@ static void YTOnMain(dispatch_block_t block) {
     }
 }
 
-static void YTOnMainSync(dispatch_block_t block) {
-    if ([NSThread isMainThread]) {
-        block();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), block);
-    }
-}
-
 static NSTextField *YTLabel(NSRect frame, CGFloat size, NSFontWeight weight, NSColor *color) {
     NSTextField *label = [[NSTextField alloc] initWithFrame:frame];
     label.bezeled = NO;
@@ -294,32 +286,21 @@ void YTStopApplication(void) {
     });
 }
 
-void YTShowWaiting(const char *soundName, const char *titleText, const char *subtitleText, const char *bundleIdentifierText, int fallback, unsigned long long requestID) {
+void YTShowWaiting(const char *soundName, const char *titleText, const char *subtitleText, const char *bundleIdentifierText, unsigned long long requestID) {
     NSString *sound = soundName == NULL ? @"" : [NSString stringWithUTF8String:soundName];
     NSString *title = titleText == NULL ? @"未知程序正在请求 SSH 签名" : [NSString stringWithUTF8String:titleText];
     NSString *subtitle = subtitleText == NULL ? @"请触摸 YubiKey" : [NSString stringWithUTF8String:subtitleText];
     NSString *bundleIdentifier = bundleIdentifierText == NULL ? @"" : [NSString stringWithUTF8String:bundleIdentifierText];
-    dispatch_block_t show = ^{
+    YTOnMain(^{
         YTCurrentRequestID = requestID;
         atomic_store(&YTCancelRequestID, 0);
-        if (fallback) {
-            YTShow(@"key.fill", NSColor.systemBlueColor, title, subtitle, bundleIdentifier);
-            [NSApp activateIgnoringOtherApps:YES];
-        } else {
-            YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, title, subtitle, bundleIdentifier);
-        }
+        YTShow(@"hand.point.up.left.fill", NSColor.systemOrangeColor, title, subtitle, bundleIdentifier);
         YTCancelButton.enabled = YES;
         YTCancelButton.hidden = NO;
         if (sound.length > 0 && ![sound isEqualToString:@"none"]) {
             [[NSSound soundNamed:sound] play];
         }
-    };
-    if (fallback) {
-        // 1Password suppresses SSH authorization prompts from background applications.
-        YTOnMainSync(show);
-    } else {
-        YTOnMain(show);
-    }
+    });
 }
 
 void YTShowSuccess(const char *titleText, const char *bundleIdentifierText, unsigned long long requestID) {

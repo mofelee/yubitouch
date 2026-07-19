@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mofelee/yubitouch/internal/backend"
 	"github.com/mofelee/yubitouch/internal/buildinfo"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/daemon"
@@ -127,11 +126,6 @@ type Status struct {
 	DaemonPID         int    `json:"daemon_pid,omitempty"`
 	LastSignEvent     string `json:"last_sign_event,omitempty"`
 	LastSignAt        string `json:"last_sign_at,omitempty"`
-	LastSigner        string `json:"last_signer,omitempty"`
-	FallbackEnabled   bool   `json:"fallback_enabled"`
-	FallbackAgent     string `json:"fallback_agent,omitempty"`
-	FallbackReachable bool   `json:"fallback_agent_reachable"`
-	FallbackKeyFound  bool   `json:"fallback_key_available"`
 	DiagnosticLog     string `json:"diagnostic_log,omitempty"`
 	LogPermissions    string `json:"log_permissions,omitempty"`
 	LogSizeBytes      int64  `json:"log_size_bytes,omitempty"`
@@ -194,15 +188,6 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	}
 	status.PINProvider = string(cfg.PINProvider)
 	status.PublicKey = cfg.Fingerprint()
-	if cfg.FallbackAgent == config.FallbackAgent1Password {
-		status.FallbackEnabled = true
-		status.FallbackAgent = string(cfg.FallbackAgent)
-		fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), time.Second)
-		report, _ := backend.InspectFallback(fallbackCtx, cfg)
-		fallbackCancel()
-		status.FallbackReachable = report.Reachable
-		status.FallbackKeyFound = report.TargetKeyFound
-	}
 	deviceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	deviceCount, deviceErr := env.ProbeYubiKeys(deviceCtx)
 	cancel()
@@ -232,12 +217,6 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	}
 	fmt.Fprintf(stdout, "PIN provider: %s\n", status.PINProvider)
 	fmt.Fprintf(stdout, "Public key: %s\n", status.PublicKey)
-	if status.FallbackEnabled {
-		fmt.Fprintf(stdout, "Fallback agent: %s (socket %s, target key %s)\n",
-			status.FallbackAgent, availability(status.FallbackReachable), availability(status.FallbackKeyFound))
-	} else {
-		fmt.Fprintln(stdout, "Fallback agent: disabled")
-	}
 	fmt.Fprintf(stdout, "YubiKey: %s", status.YubiKeyState)
 	if status.YubiKeyCount > 0 {
 		fmt.Fprintf(stdout, " (%d connected)", status.YubiKeyCount)
@@ -278,19 +257,6 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 		"runtime directory permissions", "expected 0700 at "+runtimeDir)
 	check(cfg.PublicKey != nil, "target public key", cfg.Fingerprint())
 	check(launchAgentLoaded(), "LaunchAgent", launchagent.Label)
-	fallbackReady := false
-	if cfg.FallbackAgent == config.FallbackAgent1Password {
-		fallbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		fallbackReport, fallbackErr := backend.InspectFallback(fallbackCtx, cfg)
-		cancel()
-		check(fallbackReport.Reachable, "1Password SSH Agent fallback", "configured socket is reachable")
-		check(fallbackErr == nil && fallbackReport.TargetKeyFound,
-			"1Password fallback target key", "configured public key is available")
-		if fallbackReport.Reachable {
-			check(true, "hidden 1Password keys", fmt.Sprintf("%d non-target key(s) will be filtered", fallbackReport.OtherKeys))
-		}
-		fallbackReady = fallbackErr == nil && fallbackReport.TargetKeyFound
-	}
 
 	deps, depErr := system.Resolve(cfg)
 	if depErr != nil {
@@ -303,9 +269,7 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 		hardwareCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		report, hardwareErr := system.InspectHardware(hardwareCtx, cfg, deps)
 		cancel()
-		if errors.Is(hardwareErr, system.ErrDeviceNotDetected) && fallbackReady {
-			check(true, "YubiKey", "not detected; exact target key is available through 1Password fallback")
-		} else if hardwareErr != nil {
+		if hardwareErr != nil {
 			check(false, "YubiKey PIV", hardwareErr.Error())
 		} else {
 			check(report.DeviceCount > 0, "YubiKey", fmt.Sprintf("%d device(s) detected", report.DeviceCount))
@@ -428,7 +392,7 @@ func runTestSign(stdout io.Writer, stderr io.Writer, env Environment) int {
 	deviceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	deviceCount, deviceErr := env.ProbeYubiKeys(deviceCtx)
 	cancel()
-	if deviceErr == nil && deviceCount <= 0 && cfg.FallbackAgent != config.FallbackAgent1Password {
+	if deviceErr == nil && deviceCount <= 0 {
 		fmt.Fprintln(stderr, "no YubiKey was detected; insert the device and retry yubitouch test-sign")
 		return ExitDeviceMissing
 	}
@@ -494,12 +458,6 @@ func reportSignFailure(stderr io.Writer, failureClass string, configPath string)
 	case diagnostic.FailureKeyMismatch:
 		fmt.Fprintln(stderr, "the loaded PIV 9A key does not match the configured public key; run yubitouch doctor")
 		return ExitKeyMismatch
-	case diagnostic.FailureFallbackKeyUnavailable:
-		fmt.Fprintln(stderr, "the configured SSH key is not available in the 1Password fallback agent; run yubitouch doctor")
-		return ExitKeyMismatch
-	case diagnostic.FailureFallbackUnavailable:
-		fmt.Fprintln(stderr, "the 1Password fallback agent is unavailable; unlock 1Password, verify SSH Agent is enabled, and retry")
-		return ExitRuntimeError
 	case diagnostic.FailureTimeout:
 		fmt.Fprintln(stderr, "the signature request timed out; retry and complete PIN authorization or touch the YubiKey when prompted")
 		return ExitSignTimeout
@@ -588,7 +546,6 @@ func yubiKeyState(count int, err error) (string, int) {
 
 func mergePersistedState(status *Status, persisted state.State, current bool) {
 	status.LastSignEvent = persisted.LastSignEvent
-	status.LastSigner = persisted.LastSigner
 	if !persisted.LastSignAt.IsZero() {
 		status.LastSignAt = persisted.LastSignAt.Format(time.RFC3339)
 	}

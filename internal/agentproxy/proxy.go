@@ -37,10 +37,6 @@ type Backend interface {
 	io.Closer
 }
 
-type closeAfterSigner interface {
-	CloseAfterSign() bool
-}
-
 type BackendFactory func(context.Context) (Backend, error)
 
 type Server struct {
@@ -271,17 +267,14 @@ func (a *connectionAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	if !sameKey(a.target, key) {
 		return nil, ErrKeyNotAllowed
 	}
-	return a.coordinator.SignContextCancelableFor(
+	backend, err := a.getSigningBackend()
+	if err != nil {
+		return nil, err
+	}
+	return a.coordinator.SignCancelableFor(
 		a.ctx,
 		a.requester,
-		func(requestCtx context.Context) (*ssh.Signature, error) {
-			backend, err := a.getSigningBackend(requestCtx)
-			if err != nil {
-				return nil, err
-			}
-			if policy, ok := backend.(closeAfterSigner); ok && policy.CloseAfterSign() {
-				defer a.closeSigningBackend()
-			}
+		func() (*ssh.Signature, error) {
 			return backend.SignWithFlags(key, data, flags)
 		},
 		a.closeSigningBackend,
@@ -329,7 +322,7 @@ func (a *connectionAgent) Lock([]byte) error              { return ErrOperationD
 func (a *connectionAgent) Unlock([]byte) error            { return ErrOperationDenied }
 func (a *connectionAgent) Signers() ([]ssh.Signer, error) { return nil, ErrOperationDenied }
 
-func (a *connectionAgent) getSigningBackend(ctx context.Context) (Backend, error) {
+func (a *connectionAgent) getSigningBackend() (Backend, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.backend != nil {
@@ -339,11 +332,11 @@ func (a *connectionAgent) getSigningBackend(ctx context.Context) (Backend, error
 		_ = a.backend.Close()
 		a.backend = nil
 	}
-	return a.connectBackendLocked(ctx)
+	return a.connectBackendLocked()
 }
 
-func (a *connectionAgent) connectBackendLocked(ctx context.Context) (Backend, error) {
-	backend, err := a.backendFactory(ctx)
+func (a *connectionAgent) connectBackendLocked() (Backend, error) {
+	backend, err := a.backendFactory(a.ctx)
 	if err != nil {
 		return nil, err
 	}

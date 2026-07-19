@@ -9,7 +9,7 @@ package macos
 void YTInitializeApplication(void);
 void YTRunApplication(void);
 void YTStopApplication(void);
-void YTShowWaiting(const char *soundName, const char *title, const char *subtitle, const char *bundleIdentifier, int fallback, unsigned long long requestID);
+void YTShowWaiting(const char *soundName, const char *title, const char *subtitle, const char *bundleIdentifier, unsigned long long requestID);
 void YTShowSuccess(const char *title, const char *bundleIdentifier, unsigned long long requestID);
 void YTShowFailure(const char *title, const char *message, const char *bundleIdentifier, unsigned long long requestID);
 void YTHide(unsigned long long requestID);
@@ -39,7 +39,7 @@ func StopApplication() {
 	C.YTStopApplication()
 }
 
-func ShowWaiting(sound string, title string, subtitle string, bundleIdentifier string, fallback bool, requestID uint64) {
+func ShowWaiting(sound string, title string, subtitle string, bundleIdentifier string, requestID uint64) {
 	soundValue := C.CString(sound)
 	defer C.free(unsafe.Pointer(soundValue))
 	titleValue := C.CString(title)
@@ -48,11 +48,7 @@ func ShowWaiting(sound string, title string, subtitle string, bundleIdentifier s
 	defer C.free(unsafe.Pointer(subtitleValue))
 	bundleValue := C.CString(bundleIdentifier)
 	defer C.free(unsafe.Pointer(bundleValue))
-	fallbackValue := C.int(0)
-	if fallback {
-		fallbackValue = 1
-	}
-	C.YTShowWaiting(soundValue, titleValue, subtitleValue, bundleValue, fallbackValue, C.ulonglong(requestID))
+	C.YTShowWaiting(soundValue, titleValue, subtitleValue, bundleValue, C.ulonglong(requestID))
 }
 
 func ShowSuccess(title string, bundleIdentifier string, requestID uint64) {

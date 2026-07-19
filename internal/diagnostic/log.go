@@ -52,8 +52,6 @@ const (
 	FailureDeviceUnavailable      FailureClass = "device_unavailable"
 	FailureKeyMismatch            FailureClass = "key_mismatch"
 	FailureProviderInitialization FailureClass = "provider_initialization"
-	FailureFallbackUnavailable    FailureClass = "fallback_unavailable"
-	FailureFallbackKeyUnavailable FailureClass = "fallback_key_unavailable"
 	FailureBackendUnavailable     FailureClass = "backend_unavailable"
 	FailurePermission             FailureClass = "permission"
 	FailureConfiguration          FailureClass = "configuration"
@@ -225,8 +223,6 @@ func validFailureClass(failure FailureClass) bool {
 		FailureDeviceUnavailable,
 		FailureKeyMismatch,
 		FailureProviderInitialization,
-		FailureFallbackUnavailable,
-		FailureFallbackKeyUnavailable,
 		FailureBackendUnavailable,
 		FailurePermission,
 		FailureConfiguration,
@@ -279,12 +275,6 @@ func Classify(err error) FailureClass {
 	}
 	if errors.Is(err, signing.ErrDeviceUnavailable) {
 		return FailureDeviceUnavailable
-	}
-	if errors.Is(err, signing.ErrFallbackKeyUnavailable) {
-		return FailureFallbackKeyUnavailable
-	}
-	if errors.Is(err, signing.ErrFallbackUnavailable) {
-		return FailureFallbackUnavailable
 	}
 	message := strings.ToLower(err.Error())
 	switch {

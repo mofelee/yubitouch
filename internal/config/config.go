@@ -31,27 +31,18 @@ const (
 	PINProvider1Password PINProvider = "1password"
 )
 
-type FallbackAgent string
-
-const (
-	FallbackAgentNone      FallbackAgent = ""
-	FallbackAgent1Password FallbackAgent = "1password"
-)
-
 type Config struct {
-	PINProvider         PINProvider   `json:"pin_provider"`
-	OnePasswordAccount  string        `json:"onepassword_account,omitempty"`
-	OnePasswordRef      string        `json:"onepassword_ref,omitempty"`
-	PublicKeyPath       string        `json:"public_key"`
-	YKCS11Path          string        `json:"ykcs11"`
-	OpenSSHPrefix       string        `json:"openssh_prefix"`
-	SocketPath          string        `json:"socket"`
-	BackendSocketPath   string        `json:"backend_socket"`
-	FallbackAgent       FallbackAgent `json:"fallback_agent,omitempty"`
-	FallbackAgentSocket string        `json:"fallback_agent_socket,omitempty"`
-	Sound               string        `json:"sound"`
-	SignTimeout         Duration      `json:"sign_timeout"`
-	LogLevel            string        `json:"log_level"`
+	PINProvider        PINProvider `json:"pin_provider"`
+	OnePasswordAccount string      `json:"onepassword_account,omitempty"`
+	OnePasswordRef     string      `json:"onepassword_ref,omitempty"`
+	PublicKeyPath      string      `json:"public_key"`
+	YKCS11Path         string      `json:"ykcs11"`
+	OpenSSHPrefix      string      `json:"openssh_prefix"`
+	SocketPath         string      `json:"socket"`
+	BackendSocketPath  string      `json:"backend_socket"`
+	Sound              string      `json:"sound"`
+	SignTimeout        Duration    `json:"sign_timeout"`
+	LogLevel           string      `json:"log_level"`
 
 	PublicKey ssh.PublicKey `json:"-"`
 }
@@ -269,10 +260,6 @@ func (c *Config) ResolveAndValidate(home string) error {
 	c.YKCS11Path = stableYKCS11Path(c.YKCS11Path)
 	c.SocketPath = expandPath(c.SocketPath, home)
 	c.BackendSocketPath = expandPath(c.BackendSocketPath, home)
-	if c.FallbackAgent == FallbackAgent1Password && strings.TrimSpace(c.FallbackAgentSocket) == "" {
-		c.FallbackAgentSocket = defaultOnePasswordAgentSocket(home)
-	}
-	c.FallbackAgentSocket = expandPath(c.FallbackAgentSocket, home)
 
 	if c.PINProvider != PINProviderPrompt && c.PINProvider != PINProvider1Password {
 		return fmt.Errorf("invalid pin_provider %q", c.PINProvider)
@@ -284,15 +271,6 @@ func (c *Config) ResolveAndValidate(home string) error {
 		if !strings.HasPrefix(c.OnePasswordRef, "op://") {
 			return errors.New("onepassword_ref must be an op:// secret reference")
 		}
-	}
-	if c.FallbackAgent != FallbackAgentNone && c.FallbackAgent != FallbackAgent1Password {
-		return fmt.Errorf("invalid fallback_agent %q", c.FallbackAgent)
-	}
-	if c.FallbackAgent == FallbackAgentNone && c.FallbackAgentSocket != "" {
-		return errors.New("fallback_agent_socket requires fallback_agent=1password")
-	}
-	if c.FallbackAgent == FallbackAgent1Password && c.FallbackAgentSocket == "" {
-		return errors.New("fallback_agent_socket is required for the 1password fallback")
 	}
 	if strings.TrimSpace(c.PublicKeyPath) == "" {
 		return errors.New("public_key is required")
@@ -314,9 +292,6 @@ func (c *Config) ResolveAndValidate(home string) error {
 	if c.SocketPath == c.BackendSocketPath {
 		return errors.New("socket and backend_socket must be different")
 	}
-	if c.FallbackAgentSocket != "" && (c.FallbackAgentSocket == c.SocketPath || c.FallbackAgentSocket == c.BackendSocketPath) {
-		return errors.New("fallback_agent_socket must be different from YubiTouch sockets")
-	}
 	// Darwin sockaddr_un.sun_path is 104 bytes including the terminator.
 	if runtime.GOOS == "darwin" {
 		if len(c.SocketPath) >= 104 {
@@ -324,9 +299,6 @@ func (c *Config) ResolveAndValidate(home string) error {
 		}
 		if len(c.BackendSocketPath) >= 104 {
 			return fmt.Errorf("backend_socket path is too long for macOS: %s", c.BackendSocketPath)
-		}
-		if len(c.FallbackAgentSocket) >= 104 {
-			return fmt.Errorf("fallback_agent_socket path is too long for macOS: %s", c.FallbackAgentSocket)
 		}
 	}
 	return nil
@@ -371,16 +343,6 @@ func applyEnvironment(cfg *Config, getenv func(string) string) {
 	setString("YUBITOUCH_OPENSSH_PREFIX", &cfg.OpenSSHPrefix)
 	setString("YUBITOUCH_SOCKET", &cfg.SocketPath)
 	setString("YUBITOUCH_BACKEND_SOCKET", &cfg.BackendSocketPath)
-	if value := strings.TrimSpace(getenv("YUBITOUCH_FALLBACK_AGENT")); value != "" {
-		switch strings.ToLower(value) {
-		case "none", "off", "disabled":
-			cfg.FallbackAgent = FallbackAgentNone
-			cfg.FallbackAgentSocket = ""
-		default:
-			cfg.FallbackAgent = FallbackAgent(value)
-		}
-	}
-	setString("YUBITOUCH_FALLBACK_AGENT_SOCKET", &cfg.FallbackAgentSocket)
 	setString("YUBITOUCH_SOUND", &cfg.Sound)
 	setString("YUBITOUCH_LOG_LEVEL", &cfg.LogLevel)
 	if value := strings.TrimSpace(getenv("YUBITOUCH_SIGN_TIMEOUT")); value != "" {
@@ -454,10 +416,6 @@ func defaultYKCS11Path() string {
 		}
 	}
 	return candidates[0]
-}
-
-func defaultOnePasswordAgentSocket(home string) string {
-	return filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock")
 }
 
 func stableYKCS11Path(path string) string {

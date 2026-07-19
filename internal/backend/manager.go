@@ -29,13 +29,12 @@ const deviceProbeTimeout = 3 * time.Second
 const deviceProbeInterval = 100 * time.Millisecond
 
 type Manager struct {
-	cfg           config.Config
-	deps          system.Dependencies
-	executable    string
-	configPath    string
-	processEnv    []string
-	probeKeys     func(context.Context) (int, error)
-	ensurePrimary func(context.Context) error
+	cfg        config.Config
+	deps       system.Dependencies
+	executable string
+	configPath string
+	processEnv []string
+	probeKeys  func(context.Context) (int, error)
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
@@ -43,37 +42,20 @@ type Manager struct {
 
 	providerMu sync.Mutex
 	invalid    bool
-
-	signerMu sync.RWMutex
-	signer   signing.Signer
 }
 
 func New(cfg config.Config, deps system.Dependencies, executable string, configPath string) *Manager {
-	manager := &Manager{
+	return &Manager{
 		cfg:        cfg,
 		deps:       deps,
 		executable: executable,
 		configPath: configPath,
 		processEnv: sanitizedEnvironment(os.Environ()),
 		probeKeys:  system.ProbeYubiKeys,
-		signer:     signing.SignerYubiKey,
 	}
-	manager.ensurePrimary = manager.ensureProvider
-	return manager
 }
 
 func (m *Manager) Connect(ctx context.Context) (agentproxy.Backend, error) {
-	if m.CurrentSigner() == signing.Signer1Password {
-		fallback, err := connectFallback(ctx, m.cfg)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := fallback.List(); err != nil {
-			_ = fallback.Close()
-			return nil, err
-		}
-		return fallback, nil
-	}
 	if err := m.EnsureAgent(ctx); err != nil {
 		return nil, err
 	}
@@ -81,7 +63,7 @@ func (m *Manager) Connect(ctx context.Context) (agentproxy.Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newClient(ctx, conn), nil
+	return &client{ExtendedAgent: agent.NewClient(conn), conn: conn}, nil
 }
 
 func (m *Manager) EnsureAgent(ctx context.Context) error {
@@ -173,31 +155,6 @@ func (m *Manager) discardUnavailableAgentLocked(ctx context.Context) error {
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {
-	// Fail closed on the primary route unless a completed probe proves the device is absent.
-	m.setSigner(signing.SignerYubiKey)
-	signer := m.selectSigner(ctx)
-	m.setSigner(signer)
-	if signer == signing.Signer1Password {
-		_, err := InspectFallback(ctx, m.cfg)
-		return err
-	}
-	return m.ensurePrimary(ctx)
-}
-
-func (m *Manager) selectSigner(ctx context.Context) signing.Signer {
-	if m.cfg.FallbackAgent != config.FallbackAgent1Password {
-		return signing.SignerYubiKey
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, deviceProbeTimeout)
-	defer cancel()
-	count, err := m.probeKeys(probeCtx)
-	if err == nil && count == 0 {
-		return signing.Signer1Password
-	}
-	return signing.SignerYubiKey
-}
-
-func (m *Manager) ensureProvider(ctx context.Context) error {
 	m.providerMu.Lock()
 	defer m.providerMu.Unlock()
 
@@ -226,18 +183,12 @@ func (m *Manager) ensureProvider(ctx context.Context) error {
 }
 
 func (m *Manager) Invalidate() {
-	if m.CurrentSigner() != signing.SignerYubiKey {
-		return
-	}
 	m.providerMu.Lock()
 	m.invalid = true
 	m.providerMu.Unlock()
 }
 
 func (m *Manager) NormalizeSignFailure(ctx context.Context, signErr error) error {
-	if m.CurrentSigner() != signing.SignerYubiKey {
-		return signErr
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, deviceProbeTimeout)
 	defer cancel()
 	ticker := time.NewTicker(deviceProbeInterval)
@@ -253,18 +204,6 @@ func (m *Manager) NormalizeSignFailure(ctx context.Context, signErr error) error
 		case <-ticker.C:
 		}
 	}
-}
-
-func (m *Manager) CurrentSigner() signing.Signer {
-	m.signerMu.RLock()
-	defer m.signerMu.RUnlock()
-	return m.signer
-}
-
-func (m *Manager) setSigner(signer signing.Signer) {
-	m.signerMu.Lock()
-	m.signer = signer
-	m.signerMu.Unlock()
 }
 
 func (m *Manager) Stop(ctx context.Context) error {
@@ -433,20 +372,8 @@ func sanitizedEnvironment(environment []string) []string {
 type client struct {
 	agent.ExtendedAgent
 	conn io.Closer
-	stop func() bool
 }
 
 func (c *client) Close() error {
-	if c.stop != nil {
-		c.stop()
-	}
 	return c.conn.Close()
-}
-
-func (c *client) CloseAfterSign() bool { return true }
-
-func newClient(ctx context.Context, conn net.Conn) *client {
-	value := &client{ExtendedAgent: agent.NewClient(conn), conn: conn}
-	value.stop = context.AfterFunc(ctx, func() { _ = conn.Close() })
-	return value
 }
