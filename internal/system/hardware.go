@@ -55,6 +55,9 @@ func probeYubiKeys(ctx context.Context, lookup pathLookup, run outputRunner) (in
 	}
 	serialOutput, diagnosticOutput, err := run(ctx, ykman, "list", "--serials")
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
 		return 0, fmt.Errorf("%w: %v", ErrDeviceProbe, err)
 	}
 	count := countNonEmptyLines(serialOutput)

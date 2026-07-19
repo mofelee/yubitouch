@@ -20,7 +20,7 @@ const (
 	RoutePIV             Route = "piv"
 	Route1Password       Route = "1password"
 	RoutePIVFailClosed   Route = "piv_fail_closed"
-	defaultProbeTimeout        = time.Second
+	defaultProbeTimeout        = 5 * time.Second
 	defaultPollInterval        = 2 * time.Second
 	defaultDebounceCount       = 2
 )

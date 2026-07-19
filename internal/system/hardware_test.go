@@ -60,6 +60,17 @@ func TestProbeYubiKeysClassifiesUnavailableToolAndProbeFailure(t *testing.T) {
 		t.Fatalf("probe error = %v", err)
 	}
 
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = probeYubiKeys(canceled, func(string) (string, error) {
+		return "/test/ykman", nil
+	}, func(context.Context, string, ...string) ([]byte, []byte, error) {
+		return nil, nil, errors.New("killed")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled probe error = %v", err)
+	}
+
 	_, err = probeYubiKeys(context.Background(), func(string) (string, error) {
 		return "/test/ykman", nil
 	}, func(context.Context, string, ...string) ([]byte, []byte, error) {
