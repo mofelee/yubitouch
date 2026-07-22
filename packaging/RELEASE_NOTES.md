@@ -103,9 +103,9 @@ The age PIV ECDH prerequisite and the complete signed-source-build hardware `age
 flow are verified on arm64 macOS with YubiKey firmware 5.7.4, YKCS11 2.7.3, and age v1.3.1.
 Two consecutive hardware decryptions succeeded and matched the plaintext; while the 1Password PIN
 provider authorization was deliberately left pending, the YubiTouch touch UI remained hidden and
-appeared only after authorization completed. Native x86_64 consistency and real recovery success,
-authorization rejection, timeout, helper crash, and identity-mismatch paths remain pending and must
-not be inferred from unit tests.
+appeared only after authorization completed. Real recovery success, authorization rejection,
+timeout, helper crash, and identity-mismatch paths remain pending and must not be inferred from unit
+tests.
 Wrong-PIN testing consumes device retries and should only be performed on a prepared test device
 with a confirmed recovery plan.
 

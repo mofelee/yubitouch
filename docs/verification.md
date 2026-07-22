@@ -98,7 +98,6 @@ launcher 后确认两者都在短时限内消失。
 |---|---|---|---|---|---|---|---|
 | 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | PIV 82 X25519/YKCS11 ECDH spike | pass |
 | 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | 签名 App：公开描述符、离线加密、硬件解密及 1Password PIN/触摸时序 | pass（连续 2 次解密） |
-| pending | macOS 13+ | x86_64 | pending | pending | v1.3.1 | 同一硬件 ECDH 一致性 | pending |
 
 arm64 spike 使用用户预先配置的 PIV 82 X25519 key，策略为 PIN `ONCE`、touch `ALWAYS`。
 已确认无 PIN/login 可读取规范的 32 字节公钥，登录并触摸后
@@ -107,8 +106,8 @@ arm64 spike 使用用户预先配置的 PIV 82 X25519 key，策略为 PIN `ONCE`
 ECDH 输入、shared secret 或 file key。
 
 第一条 spike 只解除 arm64 硬件能力的前置阻断；第二条记录完成了源码签名 App 的公开
-recipient/identity、无 daemon/设备的离线加密，以及硬件主路径端到端解密。它不代表
-x86_64 或任何真实 1Password recovery 路径已通过。
+recipient/identity、无 daemon/设备的离线加密，以及硬件主路径端到端解密。它不代表任何
+真实 1Password recovery 路径已通过。
 
 ### 安装、格式与离线加密
 
@@ -201,17 +200,17 @@ yubitouch status --json | jq '{
 }'
 ```
 
-| 场景 | 预期 backend | recovery 调用 | 预期结果 | arm64 | x86_64 |
-|---|---|---:|---|---|---|
-| 目标设备连接且解密成功 | hardware | 0 | success | pass（连续 2 次；PIN 授权结束后才显示触摸） | pending |
-| 插入其他 YubiKey | none | 0 | target mismatch | pending | pending |
-| serial/slot/public key 不匹配 | none | 0 | target mismatch | pending | pending |
-| 探测失败或状态不明 | none | 0 | probe unavailable | pending | pending |
-| PIN provider 失败/取消 | hardware | 0 | fail closed | pending | pending |
-| 触摸取消 | hardware | 0 | canceled | pending | pending |
-| 触摸超时 | hardware | 0 | timeout | pending | pending |
-| 设备在操作中移除 | hardware | 0 | fail closed | pending | pending |
-| YKCS11/ECDH/KDF/AEAD 失败 | hardware | 0 | fail closed | pending | pending |
+| 场景 | 预期 backend | recovery 调用 | 预期结果 | arm64 |
+|---|---|---:|---|---|
+| 目标设备连接且解密成功 | hardware | 0 | success | pass（连续 2 次；PIN 授权结束后才显示触摸） |
+| 插入其他 YubiKey | none | 0 | target mismatch | pending |
+| serial/slot/public key 不匹配 | none | 0 | target mismatch | pending |
+| 探测失败或状态不明 | none | 0 | probe unavailable | pending |
+| PIN provider 失败/取消 | hardware | 0 | fail closed | pending |
+| 触摸取消 | hardware | 0 | canceled | pending |
+| 触摸超时 | hardware | 0 | timeout | pending |
+| 设备在操作中移除 | hardware | 0 | fail closed | pending |
+| YKCS11/ECDH/KDF/AEAD 失败 | hardware | 0 | fail closed | pending |
 
 2026-07-22 的 arm64 隔离验收使用 1Password PIN provider。两次请求都在 Desktop App 授权
 窗口保持未完成时等待，期间没有出现 YubiTouch 触摸面板；授权完成后才显示“age 解密”触摸
