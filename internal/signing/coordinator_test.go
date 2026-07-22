@@ -16,6 +16,13 @@ type eventRecorder struct {
 	events []Event
 }
 
+type blockingWaitingSink struct {
+	recorder *eventRecorder
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
 type normalizingInitializer struct {
 	normalized error
 }
@@ -39,6 +46,14 @@ func (r *eventRecorder) types() []EventType {
 		types[i] = r.events[i].Type
 	}
 	return types
+}
+
+func (s *blockingWaitingSink) Handle(event Event) {
+	if event.Type == EventWaiting {
+		s.once.Do(func() { close(s.entered) })
+		<-s.release
+	}
+	s.recorder.Handle(event)
 }
 
 func TestCoordinatorSerializesSignatures(t *testing.T) {
@@ -409,6 +424,91 @@ func TestConcurrentCancelAndSuccessPublishOneTerminalEvent(t *testing.T) {
 		if terminalCount != 1 {
 			t.Fatalf("terminal event count = %d, events = %v", terminalCount, recorder.types())
 		}
+	}
+}
+
+func TestCancellationObservedBeforeSuccessfulCallReturns(t *testing.T) {
+	recorder := &eventRecorder{}
+	coordinator := New(nil, recorder, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := coordinator.SignCancelable(ctx, func() (*ssh.Signature, error) {
+		cancel()
+		return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+	}, nil)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("error = %v, want ErrCanceled", err)
+	}
+	want := []EventType{EventInitializing, EventWaiting, EventCanceled}
+	if got := recorder.types(); !eventTypesEqual(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestCancellationCannotBeOvertakenByDelayedWaitingEvent(t *testing.T) {
+	recorder := &eventRecorder{}
+	waitingEntered := make(chan struct{})
+	releaseWaiting := make(chan struct{})
+	sink := &blockingWaitingSink{
+		recorder: recorder,
+		entered:  waitingEntered,
+		release:  releaseWaiting,
+	}
+	coordinator := New(nil, sink, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelHandled := make(chan struct{})
+	var cancelOnce sync.Once
+	var callRan atomic.Bool
+	result := make(chan error, 1)
+	go func() {
+		_, err := coordinator.SignCancelable(
+			ctx,
+			func() (*ssh.Signature, error) {
+				callRan.Store(true)
+				return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+			},
+			func() { cancelOnce.Do(func() { close(cancelHandled) }) },
+		)
+		result <- err
+	}()
+
+	<-waitingEntered
+	cancel()
+	<-cancelHandled
+	select {
+	case err := <-result:
+		t.Fatalf("coordinator returned %v before the in-flight waiting event was ordered", err)
+	default:
+	}
+	close(releaseWaiting)
+	if err := <-result; !errors.Is(err, ErrCanceled) {
+		t.Fatalf("error = %v, want ErrCanceled", err)
+	}
+	if callRan.Load() {
+		t.Fatal("private operation ran after cancellation during waiting delivery")
+	}
+	want := []EventType{EventInitializing, EventWaiting, EventCanceled}
+	if got := recorder.types(); !eventTypesEqual(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestTimedOutSignatureResultIsNeverReturned(t *testing.T) {
+	coordinator := New(nil, nil, 10*time.Millisecond)
+	release := make(chan struct{})
+	workerDone := make(chan struct{})
+	signature, err := coordinator.Sign(context.Background(), func() (*ssh.Signature, error) {
+		defer close(workerDone)
+		<-release
+		return &ssh.Signature{Format: ssh.KeyAlgoED25519}, nil
+	})
+	if !errors.Is(err, ErrTimeout) || signature != nil {
+		t.Fatalf("Sign = %#v, %v; want nil, ErrTimeout", signature, err)
+	}
+	close(release)
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out signing worker did not finish")
 	}
 }
 

@@ -21,6 +21,16 @@ type Resolver interface {
 
 type ResolverFactory func(config.Config) (Resolver, error)
 
+// Resolve obtains a PIN through the provider selected by cfg. Callers own the
+// returned buffer and must clear it as soon as the private-key operation ends.
+func Resolve(ctx context.Context, cfg config.Config) ([]byte, error) {
+	resolver, err := resolverFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return resolver.Resolve(ctx, cfg)
+}
+
 func RunAskPass(ctx context.Context, prompt string, stdout io.Writer, stderr io.Writer, home string, getenv func(string) string) int {
 	if strings.TrimSpace(prompt) != expectedPKCS11Prompt {
 		fmt.Fprintln(stderr, "yubitouch askpass: refusing an unexpected prompt")

@@ -66,7 +66,8 @@ release_dir=${RELEASE_DIR:-$root/dist/release/$version/$goarch}
 mkdir -p "$release_dir"
 archive_name="YubiTouch-$version-darwin-$goarch.zip"
 cli_name="yubitouch-$version-darwin-$goarch"
-for name in "$archive_name" "$cli_name" SHA256SUMS release.json RELEASE_NOTES.md; do
+age_plugin_cli_name="age-plugin-yubitouch-$version-darwin-$goarch"
+for name in "$archive_name" "$cli_name" "$age_plugin_cli_name" SHA256SUMS release.json RELEASE_NOTES.md; do
   if [ -e "$release_dir/$name" ]; then
     echo "refusing to overwrite existing release artifact: $release_dir/$name" >&2
     exit 1
@@ -86,8 +87,11 @@ GOARCH="$goarch" \
 
 app="$stage/YubiTouch.app"
 binary="$app/Contents/MacOS/yubitouch"
+age_plugin_binary="$app/Contents/MacOS/age-plugin-yubitouch"
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
-  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$app"
+  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$age_plugin_binary"
+  codesign --verify --strict --verbose=2 "$age_plugin_binary"
+  codesign --force --options runtime --entitlements "$root/packaging/YubiTouch.entitlements" --timestamp --sign "$CODESIGN_IDENTITY" "$app"
   codesign --verify --strict --verbose=2 "$app"
   signed=true
 else
@@ -120,8 +124,18 @@ else
 fi
 
 cp "$binary" "$stage/$cli_name"
-chmod 0755 "$stage/$cli_name"
-touch -h -t 198001010000 "$stage/$cli_name"
+cp "$age_plugin_binary" "$stage/$age_plugin_cli_name"
+chmod 0755 "$stage/$cli_name" "$stage/$age_plugin_cli_name"
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+  codesign --force --options runtime --entitlements "$root/packaging/YubiTouch.entitlements" --timestamp --sign "$CODESIGN_IDENTITY" "$stage/$cli_name"
+  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$stage/$age_plugin_cli_name"
+else
+  codesign --force --options runtime --entitlements "$root/packaging/YubiTouch.entitlements" --sign - "$stage/$cli_name"
+  codesign --force --options runtime --sign - "$stage/$age_plugin_cli_name"
+fi
+codesign --verify --strict --verbose=2 "$stage/$cli_name"
+codesign --verify --strict --verbose=2 "$stage/$age_plugin_cli_name"
+touch -h -t 198001010000 "$stage/$cli_name" "$stage/$age_plugin_cli_name"
 
 sed \
   -e "s/@VERSION@/$version/g" \
@@ -143,11 +157,12 @@ EOF
 
 (
   cd "$stage"
-  shasum -a 256 "$archive_name" "$cli_name" release.json RELEASE_NOTES.md > SHA256SUMS
+  shasum -a 256 "$archive_name" "$cli_name" "$age_plugin_cli_name" release.json RELEASE_NOTES.md > SHA256SUMS
 )
 
 cp "$stage/$archive_name" "$release_dir/$archive_name"
 cp "$stage/$cli_name" "$release_dir/$cli_name"
+cp "$stage/$age_plugin_cli_name" "$release_dir/$age_plugin_cli_name"
 cp "$stage/release.json" "$release_dir/release.json"
 cp "$stage/RELEASE_NOTES.md" "$release_dir/RELEASE_NOTES.md"
 cp "$stage/SHA256SUMS" "$release_dir/SHA256SUMS"

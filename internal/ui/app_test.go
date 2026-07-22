@@ -19,6 +19,18 @@ func TestSignFailureMessageDistinguishesRemovedDevice(t *testing.T) {
 	}
 }
 
+func TestOperationTextDistinguishesAgeDecrypt(t *testing.T) {
+	if got := operationAction(signing.OperationAgeDecrypt); got != "age 解密" {
+		t.Fatalf("age action = %q", got)
+	}
+	if got := operationFailureMessage(signing.OperationAgeDecrypt, errors.New("opaque")); got != "age 解密失败，请检查 YubiKey 后重试" {
+		t.Fatalf("age failure = %q", got)
+	}
+	if got := operationAction(signing.OperationSSHSign); got != "SSH 签名" {
+		t.Fatalf("SSH action = %q", got)
+	}
+}
+
 func TestRequesterTextKeepsTouchInstructionAndDirectClient(t *testing.T) {
 	requester := signing.Requester{Name: "Terminal", DirectClient: "ssh"}
 	if got := requesterName(requester); got != "Terminal" {

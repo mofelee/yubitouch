@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/ageprobe"
 	"github.com/mofelee/yubitouch/internal/buildinfo"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/daemon"
@@ -48,14 +49,22 @@ const (
 )
 
 type Environment struct {
-	Home          string
-	Getenv        func(string) string
-	ProbeYubiKeys func(context.Context) (int, error)
+	Home                 string
+	Getenv               func(string) string
+	ProbeYubiKeys        func(context.Context) (int, error)
+	NewAgeHardwareReader func(string) AgeHardwareReader
+	AgeSignalContext     func(context.Context) (context.Context, context.CancelFunc)
 }
 
 func OS() Environment {
 	home, _ := os.UserHomeDir()
-	return Environment{Home: home, Getenv: os.Getenv, ProbeYubiKeys: system.ProbeYubiKeys}
+	return Environment{
+		Home:                 home,
+		Getenv:               os.Getenv,
+		ProbeYubiKeys:        system.ProbeYubiKeys,
+		NewAgeHardwareReader: newAgeHardwareReader,
+		AgeSignalContext:     newAgeSignalContext,
+	}
 }
 
 func Run(args []string, stdout io.Writer, stderr io.Writer, env Environment) int {
@@ -64,6 +73,12 @@ func Run(args []string, stdout io.Writer, stderr io.Writer, env Environment) int
 	}
 	if env.ProbeYubiKeys == nil {
 		env.ProbeYubiKeys = system.ProbeYubiKeys
+	}
+	if env.NewAgeHardwareReader == nil {
+		env.NewAgeHardwareReader = newAgeHardwareReader
+	}
+	if env.AgeSignalContext == nil {
+		env.AgeSignalContext = newAgeSignalContext
 	}
 	if env.Home == "" {
 		fmt.Fprintln(stderr, "yubitouch: cannot determine the user home directory")
@@ -89,6 +104,8 @@ func Run(args []string, stdout io.Writer, stderr io.Writer, env Environment) int
 		return runAbout()
 	case "daemon":
 		return runDaemon(args[1:], stderr, env)
+	case "age":
+		return runAge(args[1:], stdout, stderr, env)
 	case "status":
 		jsonOutput := len(args) == 2 && args[1] == "--json"
 		if len(args) > 1 && !jsonOutput {
@@ -111,53 +128,75 @@ func Run(args []string, stdout io.Writer, stderr io.Writer, env Environment) int
 	}
 }
 
+func newAgeHardwareReader(configPath string) AgeHardwareReader {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		return nil
+	}
+	return ageprobe.NewRunner(executable, configPath, 5*time.Second)
+}
+
+func newAgeSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
 type Status struct {
-	Version           string `json:"version"`
-	ConfigPath        string `json:"config_path"`
-	Configured        bool   `json:"configured"`
-	ConfigPermissions string `json:"config_permissions,omitempty"`
-	AgentSocket       string `json:"agent_socket,omitempty"`
-	AgentReachable    bool   `json:"agent_reachable"`
-	PIVAgentSocket    string `json:"piv_agent_socket,omitempty"`
-	PIVAgentReachable bool   `json:"piv_agent_reachable"`
-	BackendSocket     string `json:"backend_socket,omitempty"`
-	BackendReachable  bool   `json:"backend_reachable"`
-	PINProvider       string `json:"pin_provider,omitempty"`
-	PublicKey         string `json:"public_key,omitempty"`
-	ProviderState     string `json:"provider_state"`
-	LaunchAgentLoaded bool   `json:"launch_agent_loaded"`
-	DaemonPID         int    `json:"daemon_pid,omitempty"`
-	LastSignEvent     string `json:"last_sign_event,omitempty"`
-	LastSignAt        string `json:"last_sign_at,omitempty"`
-	AgentRoute        string `json:"agent_route,omitempty"`
-	RouteProbeState   string `json:"route_probe_state,omitempty"`
-	RouteChangedAt    string `json:"route_changed_at,omitempty"`
-	RouteStateStale   bool   `json:"route_state_stale"`
-	RouteGuardReady   bool   `json:"route_guard_ready"`
-	FallbackEnabled   bool   `json:"fallback_enabled"`
-	FallbackAgent     string `json:"fallback_agent,omitempty"`
-	FallbackChecked   bool   `json:"fallback_checked"`
-	FallbackReachable bool   `json:"fallback_agent_reachable"`
-	FallbackKeyFound  bool   `json:"fallback_key_available"`
-	FallbackOtherKeys int    `json:"fallback_other_keys"`
-	DiagnosticLog     string `json:"diagnostic_log,omitempty"`
-	LogPermissions    string `json:"log_permissions,omitempty"`
-	LogSizeBytes      int64  `json:"log_size_bytes,omitempty"`
-	YubiKeyState      string `json:"yubikey_state"`
-	YubiKeyCount      int    `json:"yubikey_count"`
-	StateStale        bool   `json:"state_stale"`
+	Version               string `json:"version"`
+	ConfigPath            string `json:"config_path"`
+	Configured            bool   `json:"configured"`
+	ConfigPermissions     string `json:"config_permissions,omitempty"`
+	AgentSocket           string `json:"agent_socket,omitempty"`
+	AgentReachable        bool   `json:"agent_reachable"`
+	PIVAgentSocket        string `json:"piv_agent_socket,omitempty"`
+	PIVAgentReachable     bool   `json:"piv_agent_reachable"`
+	BackendSocket         string `json:"backend_socket,omitempty"`
+	BackendReachable      bool   `json:"backend_reachable"`
+	PINProvider           string `json:"pin_provider,omitempty"`
+	PublicKey             string `json:"public_key,omitempty"`
+	ProviderState         string `json:"provider_state"`
+	LaunchAgentLoaded     bool   `json:"launch_agent_loaded"`
+	DaemonPID             int    `json:"daemon_pid,omitempty"`
+	LastSignEvent         string `json:"last_sign_event,omitempty"`
+	LastSignAt            string `json:"last_sign_at,omitempty"`
+	AgentRoute            string `json:"agent_route,omitempty"`
+	RouteProbeState       string `json:"route_probe_state,omitempty"`
+	RouteChangedAt        string `json:"route_changed_at,omitempty"`
+	RouteStateStale       bool   `json:"route_state_stale"`
+	RouteGuardReady       bool   `json:"route_guard_ready"`
+	FallbackEnabled       bool   `json:"fallback_enabled"`
+	FallbackAgent         string `json:"fallback_agent,omitempty"`
+	FallbackChecked       bool   `json:"fallback_checked"`
+	FallbackReachable     bool   `json:"fallback_agent_reachable"`
+	FallbackKeyFound      bool   `json:"fallback_key_available"`
+	FallbackOtherKeys     int    `json:"fallback_other_keys"`
+	DiagnosticLog         string `json:"diagnostic_log,omitempty"`
+	LogPermissions        string `json:"log_permissions,omitempty"`
+	LogSizeBytes          int64  `json:"log_size_bytes,omitempty"`
+	YubiKeyState          string `json:"yubikey_state"`
+	YubiKeyCount          int    `json:"yubikey_count"`
+	StateStale            bool   `json:"state_stale"`
+	AgeConfigured         bool   `json:"age_configured"`
+	AgeSocketReachable    bool   `json:"age_socket_reachable"`
+	AgeRecoveryConfigured bool   `json:"age_recovery_configured"`
+	AgeBackend            string `json:"age_backend,omitempty"`
+	AgeResult             string `json:"age_result,omitempty"`
+	LastAgeAt             string `json:"last_age_at,omitempty"`
 }
 
 func runConfigure(stdout io.Writer, stderr io.Writer, env Environment) int {
 	path := config.PathFromEnvironment(env.Home, env.Getenv)
-	cfg, err := config.LoadForConfigure(path, env.Home, env.Getenv)
+	cfg, err := config.Configure(path, env.Home, env.Getenv)
 	if err != nil {
+		if errors.Is(err, config.ErrConfigurationWrite) {
+			fmt.Fprintf(stderr, "cannot save configuration: %v\n", err)
+			return ExitRuntimeError
+		}
 		fmt.Fprintf(stderr, "configuration error: %v\n", err)
 		return ExitConfigError
-	}
-	if err := config.Save(path, cfg); err != nil {
-		fmt.Fprintf(stderr, "cannot save configuration: %v\n", err)
-		return ExitRuntimeError
 	}
 	fmt.Fprintf(stdout, "Configuration saved to %s\n", path)
 	fmt.Fprintf(stdout, "Public key: %s\n", cfg.Fingerprint())
@@ -204,6 +243,11 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	}
 	status.PINProvider = string(cfg.PINProvider)
 	status.PublicKey = cfg.Fingerprint()
+	if cfg.Age != nil {
+		status.AgeConfigured = true
+		status.AgeSocketReachable = socketReachable(cfg.AgeSocketPath)
+		status.AgeRecoveryConfigured = cfg.Age.Recovery != nil
+	}
 	if cfg.FallbackAgent == config.FallbackAgent1Password {
 		status.FallbackEnabled = true
 		status.FallbackAgent = string(cfg.FallbackAgent)
@@ -226,7 +270,8 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 		routeContradiction := routeErr == nil && routeContradictsProbe(physicalRoute.Route, status.YubiKeyState)
 		current := status.AgentReachable && status.PIVAgentReachable && routeErr == nil &&
 			physicalRoute.Managed && physicalRoute.TargetReachable && processAlive(persisted.PID) &&
-			physicalMatches && !routeContradiction && status.RouteGuardReady
+			physicalMatches && !routeContradiction && status.RouteGuardReady &&
+			(!status.AgeConfigured || status.AgeSocketReachable)
 		mergePersistedState(&status, persisted, current)
 		status.RouteStateStale = !current
 	}
@@ -249,6 +294,12 @@ func runStatus(stdout io.Writer, stderr io.Writer, env Environment, jsonOutput b
 	}
 	fmt.Fprintf(stdout, "PIN provider: %s\n", status.PINProvider)
 	fmt.Fprintf(stdout, "Public key: %s\n", status.PublicKey)
+	fmt.Fprintf(stdout, "age: %s\n", configured(status.AgeConfigured))
+	fmt.Fprintf(stdout, "age socket: %s\n", availability(status.AgeSocketReachable))
+	fmt.Fprintf(stdout, "age recovery: %s\n", configured(status.AgeRecoveryConfigured))
+	if status.AgeResult != "" {
+		fmt.Fprintf(stdout, "age last operation: %s (%s)\n", status.AgeBackend, status.AgeResult)
+	}
 	if status.AgentRoute == "" {
 		fmt.Fprintln(stdout, "Agent route: unavailable")
 	} else {
@@ -319,6 +370,12 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 	check(dirErr == nil && dirInfo.IsDir() && dirInfo.Mode().Perm() == 0o700,
 		"runtime directory permissions", "expected 0700 at "+runtimeDir)
 	check(cfg.PublicKey != nil, "target public key", cfg.Fingerprint())
+	if cfg.Age != nil && cfg.Age.Recovery != nil {
+		referenceCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		valid, detail := doctorAgeRecoveryReference(referenceCtx, cfg)
+		cancel()
+		check(valid, "age recovery secret reference", detail)
+	}
 	check(launchAgentLoaded(), "LaunchAgent", launchagent.Label)
 
 	publicRoute, publicRouteErr := agentroute.InspectPublicRoute(cfg)
@@ -418,6 +475,16 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 	return ExitOK
 }
 
+func doctorAgeRecoveryReference(ctx context.Context, cfg config.Config) (bool, string) {
+	if cfg.Age == nil || cfg.Age.Recovery == nil {
+		return true, "not configured"
+	}
+	if err := config.ValidateAgeRecoveryIdentityReference(ctx, cfg.Age.Recovery.IdentityRef); err != nil {
+		return false, "syntax is invalid; update the age recovery configuration and run configure again"
+	}
+	return true, "syntax is valid; the recovery identity was not resolved"
+}
+
 func runEnsure(stdout io.Writer, stderr io.Writer, env Environment) int {
 	path := config.PathFromEnvironment(env.Home, env.Getenv)
 	cfg, err := config.Load(path, env.Home)
@@ -489,6 +556,11 @@ func runTestSign(stdout io.Writer, stderr io.Writer, env Environment) int {
 		fmt.Fprintf(stderr, "configuration error: %v\n", err)
 		return ExitConfigError
 	}
+	requestTimeout, ok := config.SignTimeoutWithMargin(cfg.SignTimeout.Duration, time.Second)
+	if !ok {
+		fmt.Fprintln(stderr, "configuration error: invalid sign_timeout")
+		return ExitConfigError
+	}
 	deviceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	deviceCount, deviceErr := env.ProbeYubiKeys(deviceCtx)
 	cancel()
@@ -510,7 +582,10 @@ func runTestSign(stdout io.Writer, stderr io.Writer, env Environment) int {
 		return ExitRuntimeError
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(cfg.SignTimeout.Duration + time.Second))
+	if err := conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+		fmt.Fprintln(stderr, "cannot set the test-sign request deadline")
+		return ExitRuntimeError
+	}
 	client := agent.NewClient(conn)
 	keys, err := client.List()
 	if err != nil {
@@ -675,6 +750,13 @@ func availability(ok bool) string {
 	return "unavailable"
 }
 
+func configured(ok bool) string {
+	if ok {
+		return "configured"
+	}
+	return "disabled"
+}
+
 func yubiKeyState(count int, err error) (string, int) {
 	if err != nil {
 		return yubiKeyProbeUnavailable, 0
@@ -707,6 +789,11 @@ func mergePersistedState(status *Status, persisted state.State, current bool) {
 	status.FallbackChecked = persisted.FallbackChecked
 	status.DaemonPID = persisted.PID
 	status.ProviderState = persisted.ProviderState
+	status.AgeBackend = persisted.AgeBackend
+	status.AgeResult = persisted.AgeResult
+	if !persisted.LastAgeAt.IsZero() {
+		status.LastAgeAt = persisted.LastAgeAt.Format(time.RFC3339)
+	}
 }
 
 func persistedRouteMatches(persisted string, physical agentroute.Route) bool {
@@ -749,6 +836,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  stop            Stop the current-user LaunchAgent")
 	fmt.Fprintln(w, "  doctor          Check local dependencies and permissions")
 	fmt.Fprintln(w, "  test-sign       Exercise the local PIN, touch, and sign flow")
+	fmt.Fprintln(w, "  age recipient   Print the configured age recipient")
+	fmt.Fprintln(w, "  age identity    Print the configured age plugin identity")
 	fmt.Fprintln(w, "  about           Show project identity and affiliation information")
 	fmt.Fprintln(w, "  version         Show version information")
 }

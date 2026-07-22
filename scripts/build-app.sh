@@ -8,6 +8,8 @@ bundle_short_version=${BUNDLE_SHORT_VERSION:-0.1.0}
 bundle_version=${BUNDLE_VERSION:-1}
 package=${GO_PACKAGE:-./cmd/yubitouch}
 executable=${EXECUTABLE_NAME:-yubitouch}
+age_plugin_package=${AGE_PLUGIN_GO_PACKAGE:-./cmd/age-plugin-yubitouch}
+age_plugin_executable=${AGE_PLUGIN_EXECUTABLE_NAME:-age-plugin-yubitouch}
 output=${OUTPUT_DIR:-$root/dist}
 version=${VERSION:-dev}
 commit=${COMMIT:-}
@@ -30,6 +32,20 @@ case "$executable" in
     exit 2
     ;;
 esac
+case "$age_plugin_executable" in
+  ''|*/*)
+    echo "age plugin executable name must be a simple path component" >&2
+    exit 2
+    ;;
+esac
+if [ "$age_plugin_executable" != "age-plugin-yubitouch" ]; then
+  echo "age plugin executable must be named age-plugin-yubitouch" >&2
+  exit 2
+fi
+if [ "$age_plugin_executable" = "$executable" ]; then
+  echo "app and age plugin executable names must be different" >&2
+  exit 2
+fi
 case "$version:$commit" in
   *[!A-Za-z0-9._:+-]*)
     echo "version and commit contain unsupported characters" >&2
@@ -62,5 +78,15 @@ CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" GOCACHE=${GOCACHE:-/tmp/yubitouch-goc
   -o "$contents/MacOS/$executable" \
   "$package"
 
-chmod 0755 "$contents/MacOS/$executable"
+CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" GOCACHE=${GOCACHE:-/tmp/yubitouch-gocache} go build \
+  -buildvcs=false \
+  -trimpath \
+  -o "$contents/MacOS/$age_plugin_executable" \
+  "$age_plugin_package"
+
+chmod 0755 "$contents/MacOS/$executable" "$contents/MacOS/$age_plugin_executable"
+codesign --force --options runtime --sign - "$contents/MacOS/$age_plugin_executable"
+codesign --force --options runtime --entitlements "$root/packaging/YubiTouch.entitlements" --sign - "$app"
+codesign --verify --strict "$contents/MacOS/$age_plugin_executable"
+codesign --verify --strict "$app"
 echo "$app"

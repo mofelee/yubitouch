@@ -101,7 +101,7 @@ func isDebianForm(value string) bool {
 
 func isGenericProcess(value string) bool {
 	switch strings.ToLower(filepath.Base(strings.TrimSpace(value))) {
-	case "", "ssh", "ssh-add", "ssh-agent", "git", "git-remote-ssh", "sh", "bash", "dash", "zsh", "fish", "env", "login", "xcrun", "open":
+	case "", "ssh", "ssh-add", "ssh-agent", "age", "age-plugin-yubitouch", "git", "git-remote-ssh", "sh", "bash", "dash", "zsh", "fish", "env", "login", "xcrun", "open":
 		return true
 	default:
 		return false

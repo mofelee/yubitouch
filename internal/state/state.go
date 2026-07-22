@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/ageipc"
 	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/ageservice"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/diagnostic"
 	"github.com/mofelee/yubitouch/internal/signing"
@@ -30,6 +32,9 @@ type State struct {
 	FallbackReachable bool      `json:"fallback_agent_reachable"`
 	FallbackKeyFound  bool      `json:"fallback_key_available"`
 	FallbackOtherKeys int       `json:"fallback_other_keys"`
+	AgeBackend        string    `json:"age_backend,omitempty"`
+	AgeResult         string    `json:"age_result,omitempty"`
+	LastAgeAt         time.Time `json:"last_age_at,omitempty"`
 }
 
 func (s *Store) SetRoute(snapshot agentroute.Snapshot) {
@@ -72,6 +77,9 @@ func (s *Store) Initialize() error {
 func (s *Store) Handle(event signing.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if event.Operation == signing.OperationAgeDecrypt {
+		return
+	}
 	s.data.LastSignEvent = string(event.Type)
 	s.data.LastSignAt = event.At.UTC()
 	s.data.LastFailureClass = ""
@@ -95,6 +103,45 @@ func (s *Store) Handle(event signing.Event) {
 		s.data.LastFailureClass = string(diagnostic.FailureTimeout)
 	}
 	_ = s.writeLocked()
+}
+
+func (s *Store) HandleAge(event ageservice.Event) {
+	if !validAgeEvent(event) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.AgeBackend = string(event.Backend)
+	s.data.AgeResult = string(event.Result)
+	s.data.LastAgeAt = event.At.UTC()
+	_ = s.writeLocked()
+}
+
+func validAgeEvent(event ageservice.Event) bool {
+	switch event.Backend {
+	case ageservice.BackendNone, ageservice.BackendHardware, ageservice.BackendRecovery:
+	default:
+		return false
+	}
+	switch event.Result {
+	case ageservice.ResultStarted,
+		ageservice.ResultSuccess,
+		ageservice.Result(ageipc.ClassInvalidRequest),
+		ageservice.Result(ageipc.ClassConfiguration),
+		ageservice.Result(ageipc.ClassDeviceNotDetected),
+		ageservice.Result(ageipc.ClassProbeUnavailable),
+		ageservice.Result(ageipc.ClassTargetMismatch),
+		ageservice.Result(ageipc.ClassPINFailed),
+		ageservice.Result(ageipc.ClassHardwareFailed),
+		ageservice.Result(ageipc.ClassRecoveryUnavailable),
+		ageservice.Result(ageipc.ClassRecoveryFailed),
+		ageservice.Result(ageipc.ClassCanceled),
+		ageservice.Result(ageipc.ClassTimeout),
+		ageservice.Result(ageipc.ClassInternal):
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) Remove() error {

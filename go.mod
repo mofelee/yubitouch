@@ -3,13 +3,17 @@ module github.com/mofelee/yubitouch
 go 1.25.0
 
 require (
+	filippo.io/age v1.3.1
 	github.com/1password/onepassword-sdk-go v0.4.0
+	github.com/miekg/pkcs11 v1.1.2
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 	howett.net/plist v1.0.1
 )
 
 require (
+	filippo.io/hpke v0.4.0 // indirect
 	github.com/dylibso/observe-sdk/go v0.0.0-20240828172851-9145d8ad07e1 // indirect
 	github.com/extism/go-sdk v1.7.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
@@ -17,6 +21,5 @@ require (
 	github.com/tetratelabs/wabin v0.0.0-20230304001439-f6f874872834 // indirect
 	github.com/tetratelabs/wazero v1.11.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

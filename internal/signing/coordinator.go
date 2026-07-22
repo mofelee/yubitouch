@@ -17,7 +17,12 @@ var (
 
 type EventType string
 
+type Operation string
+
 const (
+	OperationSSHSign    Operation = "ssh_sign"
+	OperationAgeDecrypt Operation = "age_decrypt"
+
 	EventInitializing EventType = "initializing"
 	EventWaiting      EventType = "waiting_for_touch"
 	EventSuccess      EventType = "success"
@@ -32,6 +37,7 @@ type Event struct {
 	Err       error
 	RequestID uint64
 	Requester Requester
+	Operation Operation
 }
 
 type Sink interface {
@@ -59,6 +65,33 @@ func (f InitializerFunc) Ensure(ctx context.Context) error {
 type Result struct {
 	Signature *ssh.Signature
 	Err       error
+}
+
+// requestEvents serializes progress and terminal delivery for one request.
+// Once a terminal event wins the gate, delayed worker progress is discarded.
+type requestEvents struct {
+	mu       sync.Mutex
+	terminal bool
+}
+
+func (e *requestEvents) publishProgress(ctx context.Context, coordinator *Coordinator, event Event) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.terminal || ctx.Err() != nil {
+		return false
+	}
+	coordinator.publish(event)
+	return true
+}
+
+func (e *requestEvents) publishTerminal(coordinator *Coordinator, event Event) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.terminal {
+		return
+	}
+	e.terminal = true
+	coordinator.publish(event)
 }
 
 type Coordinator struct {
@@ -106,6 +139,41 @@ func (c *Coordinator) SignFor(ctx context.Context, requester Requester, call fun
 }
 
 func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester, call func() (*ssh.Signature, error), cancelCall func()) (*ssh.Signature, error) {
+	signatureResult := make(chan *ssh.Signature, 1)
+	err := c.RunCancelableFor(
+		ctx,
+		requester,
+		OperationSSHSign,
+		c.initializer,
+		func() error {
+			signature, err := call()
+			signatureResult <- signature
+			return err
+		},
+		cancelCall,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return <-signatureResult, nil
+}
+
+// RunCancelableFor serializes a non-signing PIV operation with SSH signing.
+// The semaphore remains held until call returns, even if the caller times out.
+func (c *Coordinator) RunCancelableFor(
+	ctx context.Context,
+	requester Requester,
+	operation Operation,
+	initializer Initializer,
+	call func() error,
+	cancelCall func(),
+) error {
+	if operation == "" {
+		operation = OperationSSHSign
+	}
+	if initializer == nil {
+		initializer = InitializerFunc(func(context.Context) error { return nil })
+	}
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -115,7 +183,7 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 	select {
 	case c.semaphore <- struct{}{}:
 	case <-ctx.Done():
-		return nil, contextError(ctx)
+		return contextError(ctx)
 	}
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	activeID := c.beginActive(cancelRequest)
@@ -124,6 +192,7 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 		c.endActive(activeID)
 	}()
 	var cancelOnce sync.Once
+	events := &requestEvents{}
 	cancelOperation := func() {
 		cancelOnce.Do(func() {
 			if cancelCall != nil {
@@ -132,60 +201,74 @@ func (c *Coordinator) SignCancelableFor(ctx context.Context, requester Requester
 		})
 	}
 
-	result := make(chan Result, 1)
+	result := make(chan error, 1)
 	go func() {
 		defer func() { <-c.semaphore }()
-		c.publish(Event{Type: EventInitializing, At: c.now(), RequestID: activeID, Requester: requester})
-		if err := c.initializer.Ensure(requestCtx); err != nil {
-			result <- Result{Err: err}
+		if !events.publishProgress(requestCtx, c, Event{Type: EventInitializing, At: c.now(), RequestID: activeID, Requester: requester, Operation: operation}) {
+			result <- requestCtx.Err()
+			return
+		}
+		if err := initializer.Ensure(requestCtx); err != nil {
+			result <- err
 			return
 		}
 		if err := requestCtx.Err(); err != nil {
-			result <- Result{Err: err}
+			result <- err
 			return
 		}
-		c.publish(Event{Type: EventWaiting, At: c.now(), RequestID: activeID, Requester: requester})
-		sig, err := call()
+		if !events.publishProgress(requestCtx, c, Event{Type: EventWaiting, At: c.now(), RequestID: activeID, Requester: requester, Operation: operation}) {
+			result <- requestCtx.Err()
+			return
+		}
+		if err := requestCtx.Err(); err != nil {
+			result <- err
+			return
+		}
+		err := call()
 		if err != nil {
-			if normalizer, ok := c.initializer.(SignFailureNormalizer); ok {
+			if normalizer, ok := initializer.(SignFailureNormalizer); ok {
 				err = normalizer.NormalizeSignFailure(requestCtx, err)
 			}
-			if invalidator, ok := c.initializer.(Invalidator); ok {
+			if invalidator, ok := initializer.(Invalidator); ok {
 				invalidator.Invalidate()
 			}
 		}
-		result <- Result{Signature: sig, Err: err}
+		result <- err
 	}()
 
 	select {
-	case got := <-result:
-		if got.Err != nil {
-			if errors.Is(got.Err, context.DeadlineExceeded) {
+	case gotErr := <-result:
+		if gotErr != nil {
+			if errors.Is(gotErr, context.DeadlineExceeded) {
 				cancelOperation()
 				err := ErrTimeout
-				c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID, Requester: requester})
-				return nil, err
+				events.publishTerminal(c, Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: activeID, Requester: requester, Operation: operation})
+				return err
 			}
 			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return c.finishContext(requestCtx, activeID, requester, operation, events)
 			}
-			if errors.Is(got.Err, context.Canceled) {
+			if errors.Is(gotErr, context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return c.finishContext(requestCtx, activeID, requester, operation, events)
 			}
 			if errors.Is(requestCtx.Err(), context.Canceled) {
 				cancelOperation()
-				return nil, c.finishContext(requestCtx, activeID, requester)
+				return c.finishContext(requestCtx, activeID, requester, operation, events)
 			}
-			c.publish(Event{Type: EventFailure, At: c.now(), Err: got.Err, RequestID: activeID, Requester: requester})
-			return nil, got.Err
+			events.publishTerminal(c, Event{Type: EventFailure, At: c.now(), Err: gotErr, RequestID: activeID, Requester: requester, Operation: operation})
+			return gotErr
 		}
-		c.publish(Event{Type: EventSuccess, At: c.now(), RequestID: activeID, Requester: requester})
-		return got.Signature, nil
+		if requestCtx.Err() != nil {
+			cancelOperation()
+			return c.finishContext(requestCtx, activeID, requester, operation, events)
+		}
+		events.publishTerminal(c, Event{Type: EventSuccess, At: c.now(), RequestID: activeID, Requester: requester, Operation: operation})
+		return nil
 	case <-requestCtx.Done():
 		cancelOperation()
-		return nil, c.finishContext(requestCtx, activeID, requester)
+		return c.finishContext(requestCtx, activeID, requester, operation, events)
 	}
 }
 
@@ -222,13 +305,19 @@ func (c *Coordinator) LastEvent() Event {
 	return c.last
 }
 
-func (c *Coordinator) finishContext(ctx context.Context, requestID uint64, requester Requester) error {
+func (c *Coordinator) finishContext(
+	ctx context.Context,
+	requestID uint64,
+	requester Requester,
+	operation Operation,
+	events *requestEvents,
+) error {
 	err := contextError(ctx)
 	if errors.Is(err, ErrTimeout) {
-		c.publish(Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
+		events.publishTerminal(c, Event{Type: EventTimeout, At: c.now(), Err: err, RequestID: requestID, Requester: requester, Operation: operation})
 		return err
 	}
-	c.publish(Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID, Requester: requester})
+	events.publishTerminal(c, Event{Type: EventCanceled, At: c.now(), Err: err, RequestID: requestID, Requester: requester, Operation: operation})
 	return err
 }
 

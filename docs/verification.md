@@ -2,7 +2,9 @@
 
 本文档用于记录自动化无法覆盖的真实 macOS、YubiKey、1Password、LaunchAgent 和 SSH
 客户端结果。每次发布候选版本使用新的矩阵副本或 Issue 评论，保留命令、版本和脱敏结论。
-不得记录 PIN、PIN 长度、签名请求/结果、YubiKey 序列号、账户名或完整 secret reference。
+不得记录 PIN、PIN 长度、签名请求/结果、完整 YubiKey 序列号、账户名、完整 secret reference、
+恢复 identity、age file key 或 X25519 shared secret。组合 recipient 和插件 identity 只验证格式、
+稳定性和绑定结果，不把完整值粘贴到 Issue 或日志。
 
 ## 自动化基线
 
@@ -28,6 +30,9 @@ yubitouch version
 "$(brew --prefix openssh)/bin/ssh" -V
 brew list --versions openssh yubico-piv-tool ykman
 go list -m github.com/1password/onepassword-sdk-go
+age --version
+go list -m filippo.io/age
+command -v age-plugin-yubitouch
 ```
 
 | 日期 | macOS/build | 架构 | YubiTouch commit | OpenSSH | yubico-piv-tool | ykman | 1Password/SDK | 结果 |
@@ -60,6 +65,191 @@ reference。确认未安装 `op` CLI 时仍可工作，失败时不会回退到 
 进程且不进入 YubiKey Touch；1Password Go SDK v0.4.0 的 macOS backend 当前不响应 context
 取消（上游 #266），因此 1Password 自己拥有的授权窗口可能需要用户手动取消。记录该现象，
 但不得用 UI 自动化代替 SDK 取消能力。
+
+## age 插件（#21）
+
+本节把“硬件能力前置 spike”“当前实现的自动化测试”和“发布候选的真实端到端验证”分开
+记录。只有真实执行的项目才能写为 `pass`；单元测试通过不能替代 YubiKey 触摸、1Password
+授权、进程退出或目标架构验证。
+
+协议、IPC、helper 和 fallback 状态机的自动化基线单独运行：
+
+```sh
+go test ./internal/ageprofile ./internal/ageipc ./internal/agehardware \
+  ./internal/ageprobe ./internal/agehelper ./internal/ageservice ./internal/command
+```
+
+这些测试应覆盖 age v1.3.1 插件回合和固定向量，并拒绝未知版本/算法/路径、非规范或低阶
+X25519 key、错误 hardware ID/binding、重复 hardware/recovery、缺失 hardware、recovery 复用
+hardware ID 和损坏 ciphertext。另验证 connected 可解启用/禁用/轮换 recovery 前的密文，而
+missing fallback 只接受与当前配置 recovery ID 完全匹配的 stanza。
+
+私钥 helper 的自动化验证还应确认：macOS+cgo 下只有启用 Hardened Runtime 的同一可执行文件
+直接派生的 helper 能通过父进程认证；普通 `go test`/`go build`、`DYLD_INSERT_LIBRARIES`
+注入、经 shell 或不同可执行文件直接启动时只返回固定失败分类。注入负例必须实际加载一个带
+constructor 的测试 dylib，并确认 constructor 不执行。在拒绝路径中，配置读取、PIN provider、
+1Password identity 解析和 PKCS#11 派生都必须保持零调用；不支持这项认证的平台或未启用 cgo
+的构建必须失败关闭。另以真实 launcher 子进程启动一个阻塞 helper 和孙进程，`SIGKILL`
+launcher 后确认两者都在短时限内消失。
+
+### 当前已验证的硬件前置条件
+
+| 日期 | macOS/build | 架构 | YubiKey firmware | YKCS11 | age | 范围 | 结果 |
+|---|---|---|---|---|---|---|---|
+| 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | PIV 82 X25519/YKCS11 ECDH spike | pass |
+| 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | 签名 App：公开描述符、离线加密、硬件解密及 1Password PIN/触摸时序 | pass（连续 2 次解密） |
+| pending | macOS 13+ | x86_64 | pending | pending | v1.3.1 | 同一硬件 ECDH 一致性 | pending |
+
+arm64 spike 使用用户预先配置的 PIV 82 X25519 key，策略为 PIN `ONCE`、touch `ALWAYS`。
+已确认无 PIN/login 可读取规范的 32 字节公钥，登录并触摸后
+`CKM_ECDH1_DERIVE` 成功，结果与 Go `crypto/ecdh` X25519 通过常量时间比较一致。
+验证过程没有生成、导入、覆盖、删除或修改任何硬件 key，也没有记录完整设备 serial、PIN、
+ECDH 输入、shared secret 或 file key。
+
+第一条 spike 只解除 arm64 硬件能力的前置阻断；第二条记录完成了源码签名 App 的公开
+recipient/identity、无 daemon/设备的离线加密，以及硬件主路径端到端解密。它不代表
+x86_64 或任何真实 1Password recovery 路径已通过。
+
+### 安装、格式与离线加密
+
+先确认 App bundle 和 `PATH` 中都有精确命名的插件；主 `yubitouch` 可执行文件不能改名代替：
+
+```sh
+test -x /Applications/YubiTouch.app/Contents/MacOS/age-plugin-yubitouch
+test "$(command -v age-plugin-yubitouch)" = "$HOME/.local/bin/age-plugin-yubitouch"
+test "$(readlink "$HOME/.local/bin/age-plugin-yubitouch")" = \
+  /Applications/YubiTouch.app/Contents/MacOS/age-plugin-yubitouch
+```
+
+在本地按 README 配置六个 `YUBITOUCH_AGE_*` 输入。完整 serial、1Password reference 和
+恢复 identity 只留在本机，不放入测试记录。确认以下三个私钥环境变量中的任意一个非空都会
+使 `configure` 失败：`YUBITOUCH_AGE_RECOVERY_IDENTITY`、
+`YUBITOUCH_AGE_RECOVERY_PRIVATE_KEY`、`YUBITOUCH_AGE_RECOVERY_SECRET`。
+
+用私有临时目录检查输出恰好一行、格式正确且重复生成稳定；不要打开或打印这些文件：
+
+```sh
+age_verify_dir="$(mktemp -d)"
+chmod 700 "$age_verify_dir"
+yubitouch age recipient > "$age_verify_dir/recipient.txt"
+yubitouch age identity > "$age_verify_dir/identity.txt"
+chmod 600 "$age_verify_dir/identity.txt"
+
+test "$(wc -l < "$age_verify_dir/recipient.txt")" -eq 1
+test "$(wc -l < "$age_verify_dir/identity.txt")" -eq 1
+awk 'NR == 1 && /^age1yubitouch1[0-9a-z]+$/ { ok = 1 } END { exit !(ok && NR == 1) }' \
+  "$age_verify_dir/recipient.txt"
+awk 'NR == 1 && /^AGE-PLUGIN-YUBITOUCH-1[0-9A-Z]+$/ { ok = 1 } END { exit !(ok && NR == 1) }' \
+  "$age_verify_dir/identity.txt"
+
+yubitouch age recipient > "$age_verify_dir/recipient-second.txt"
+yubitouch age identity > "$age_verify_dir/identity-second.txt"
+cmp -s "$age_verify_dir/recipient.txt" "$age_verify_dir/recipient-second.txt"
+cmp -s "$age_verify_dir/identity.txt" "$age_verify_dir/identity-second.txt"
+```
+
+首次执行从不含 `age.public_key` 缓存的专用测试配置开始，不要手工改动生产配置。插入目标设备，
+确认读取公钥不请求 PIN、不显示触摸 UI；
+随后拔出设备再次执行，确认命令只使用缓存且输出仍稳定。配置了 recovery 时，生成 recipient
+不得触发 1Password 授权或读取恢复 identity。自动化还要证明只读 public/probe helper 的目标
+只出现在有界 pipe，不进入 argv、继承环境或 stderr；挂起 child 及其孙进程在 timeout/cancel
+后被整组终止并 `wait`，父 launcher 被 `SIGKILL` 后也必须在短时限内一并消失；crash、超大/
+尾随/合法响应后非零退出均折叠为预定义分类，随后请求仍可成功。
+
+用可控 reader 暂停首次硬件公钥读取，并在窗口内并发运行 `configure`：只修改 recovery/日志等
+非目标字段时，最终输出必须使用新 recovery 且磁盘配置保留全部并发修改；修改 serial、slot 或
+algorithm 时，本次命令必须无 stdout、不得缓存旧公钥，并返回固定的“配置已变化”错误。
+
+验证离线加密时先保存 recipient，再停止 daemon 并拔出设备。只使用无敏感内容的测试文件：
+
+```sh
+printf 'YubiTouch age verification\n' > "$age_verify_dir/plaintext"
+yubitouch stop
+age -R "$age_verify_dir/recipient.txt" \
+  -o "$age_verify_dir/plaintext.age" "$age_verify_dir/plaintext"
+test -s "$age_verify_dir/plaintext.age"
+```
+
+这一步必须在没有 daemon、YubiKey 和 1Password 访问的情况下成功。完成后运行
+`yubitouch ensure` 恢复服务；整个验证期间禁止设置 `AGEDEBUG=plugin`，因为 age 上游调试
+输出可能包含插件协议内容和 file key。
+
+### 硬件主路径
+
+插入配置的目标 YubiKey 并运行：
+
+```sh
+yubitouch ensure
+age -d -i "$age_verify_dir/identity.txt" \
+  -o "$age_verify_dir/decrypted" "$age_verify_dir/plaintext.age"
+cmp -s "$age_verify_dir/plaintext" "$age_verify_dir/decrypted"
+```
+
+确认请求先完成配置的 PIN provider，再显示“age 解密”原生触摸提示，最后只执行 hardware
+stanza，且没有 1Password recovery 授权。使用 1Password 作为 PIN provider 时，在 Desktop
+App 授权仍阻塞期间不得出现 YubiTouch 触摸面板；PIN provider 失败、取消或 YKCS11 login
+拒绝 PIN 也不得短暂显示该面板。`status --json` 只采集以下脱敏字段：
+
+```sh
+yubitouch status --json | jq '{
+  age_configured,
+  age_socket_reachable,
+  age_recovery_configured,
+  age_backend,
+  age_result,
+  last_age_at
+}'
+```
+
+| 场景 | 预期 backend | recovery 调用 | 预期结果 | arm64 | x86_64 |
+|---|---|---:|---|---|---|
+| 目标设备连接且解密成功 | hardware | 0 | success | pass（连续 2 次；PIN 授权结束后才显示触摸） | pending |
+| 插入其他 YubiKey | none | 0 | target mismatch | pending | pending |
+| serial/slot/public key 不匹配 | none | 0 | target mismatch | pending | pending |
+| 探测失败或状态不明 | none | 0 | probe unavailable | pending | pending |
+| PIN provider 失败/取消 | hardware | 0 | fail closed | pending | pending |
+| 触摸取消 | hardware | 0 | canceled | pending | pending |
+| 触摸超时 | hardware | 0 | timeout | pending | pending |
+| 设备在操作中移除 | hardware | 0 | fail closed | pending | pending |
+| YKCS11/ECDH/KDF/AEAD 失败 | hardware | 0 | fail closed | pending | pending |
+
+2026-07-22 的 arm64 隔离验收使用 1Password PIN provider。两次请求都在 Desktop App 授权
+窗口保持未完成时等待，期间没有出现 YubiTouch 触摸面板；授权完成后才显示“age 解密”触摸
+提示。两次触摸后 `age` 均以 0 退出，解密结果均与原文匹配，脱敏状态依次记录
+`age_hardware_selected` 和 `age_decrypt_succeeded`。本次配置未启用 recovery，因此不改变下方
+真实 recovery 矩阵的 `pending` 状态。
+
+错误 PIN 会消耗 YubiKey 的有限重试次数。只允许在已确认剩余次数、拥有可靠恢复方案且专门
+用于测试的设备上验证；不得为了补齐矩阵而对日常使用设备尝试错误 PIN，并确认实现不会自动
+重试。任何已经选择 hardware 的请求都不得在同一次请求中改走 recovery。
+
+另以一个等待中的 SSH 签名和一个 age 解密互换先后顺序，确认两者共享全局 PIV 队列且一次
+只有一个进入 PIN/触摸/私钥操作。取消仍在排队的请求时，不得启动其 PIN、UI 或 PIV 操作；
+客户端断开和触摸 UI 取消只影响对应 request ID，下一条请求仍可成功。
+
+### 严格 recovery
+
+仅在本机 1Password 中配置并引用独立的原生 age X25519 identity；不要把 identity 或完整
+reference 放入命令、Issue 或测试附件。先拔出所有 YubiKey，确认针对配置目标的两次有界探测
+都成功返回 `not_detected`，中间经过防抖，才执行同一个解密命令。一次请求只能启动一次
+recovery helper，不能先尝试 hardware ECDH，也不能改变 SSH `agent_route`。
+
+| 真实 recovery 场景 | helper 退出/回收 | 自动重试 | 明文/失败 | 当前结果 |
+|---|---|---:|---|---|
+| 成功授权且 identity 匹配 | 必须 | 0 | 明文匹配 | pending |
+| 用户拒绝/取消 1Password 授权 | 必须 | 0 | 失败 | pending |
+| helper/SDK 超时或客户端取消 | 必须 | 0 | 失败 | pending |
+| helper 崩溃/异常退出 | 必须 | 0 | 失败 | pending |
+| identity 与配置 recipient 不匹配 | 必须 | 0 | 失败 | pending |
+
+截至 2026-07-22，上表全部是真实环境待验证项，不得依据 mock、单元测试或 arm64 硬件 spike
+改为 `pass`。验收时确认没有孤儿 helper、临时 secret 文件或持久化 identity；1Password SDK
+返回的不可变 Go `string` 无法可靠清零，必须把禁用 core dump、短 helper 生命周期和进程退出
+作为主要隔离边界，不能宣称达到硬件私钥不可导出的安全级别。
+
+启用 recovery 还意味着 hardware 与 recovery 是 OR 关系，任一私钥都能独立恢复 file key；
+验证报告必须明确这会把整份密文的整体安全级别降低到较弱路径。完成测试后删除临时目录，
+并只记录矩阵结果、版本和 Issue 链接，不保留 identity、reference、file key 或 shared secret。
 
 ## 1Password 缺卡直接路由（#20）
 

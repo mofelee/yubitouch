@@ -79,6 +79,92 @@ func TestConfigureAndStatusJSON(t *testing.T) {
 	}
 }
 
+func TestConfigureDoesNotEchoInvalidAgeSerial(t *testing.T) {
+	home := makeBaseCommandConfig(t)
+	invalidSerial := "4294967296-sensitive-input"
+	values := map[string]string{
+		"YUBITOUCH_AGE_SERIAL":    invalidSerial,
+		"YUBITOUCH_AGE_SLOT":      "82",
+		"YUBITOUCH_AGE_ALGORITHM": "x25519",
+	}
+	env := Environment{
+		Home:   home,
+		Getenv: func(name string) string { return values[name] },
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"configure"}, &stdout, &stderr, env); code != ExitConfigError {
+		t.Fatalf("configure exit %d, want %d", code, ExitConfigError)
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "age.serial must be a canonical non-zero uint32") {
+		t.Fatalf("unexpected configure output stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), invalidSerial) {
+		t.Fatal("configure error exposed the invalid age serial")
+	}
+}
+
+func TestDoctorReportsAgeRecoveryReferenceSyntaxWithoutExposingReference(t *testing.T) {
+	home, path, cfg, _, _ := writeAgeCommandConfig(t, true, true)
+	cfg.YKCS11Path = filepath.Join(home, "missing-ykcs11.dylib")
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	env := Environment{
+		Home:          home,
+		Getenv:        func(string) string { return "" },
+		ProbeYubiKeys: func(context.Context) (int, error) { return 0, nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"doctor"}, &stdout, &stderr, env); code != ExitRuntimeError {
+		t.Fatalf("doctor exit %d, want %d; stderr=%q", code, ExitRuntimeError, stderr.String())
+	}
+	want := "[OK] age recovery secret reference: syntax is valid; the recovery identity was not resolved"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("doctor output did not report recovery reference validation: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), cfg.Age.Recovery.IdentityRef) || strings.Contains(stderr.String(), cfg.Age.Recovery.IdentityRef) {
+		t.Fatal("doctor output exposed the recovery identity reference")
+	}
+}
+
+func TestDoctorRejectsInvalidAgeRecoveryReferenceWithoutExposingReference(t *testing.T) {
+	home := makeBaseCommandConfig(t)
+	path := config.DefaultPath(home)
+	cfg, err := config.Load(path, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidReference := "op://vault/item"
+	cfg.OnePasswordAccount = "configured account"
+	cfg.Age = &config.AgeConfig{
+		Serial:    "12345678",
+		Slot:      "82",
+		Algorithm: "x25519",
+		Recovery: &config.AgeRecovery{
+			Provider:    "1password",
+			IdentityRef: invalidReference,
+			Recipient:   "not-reached",
+		},
+	}
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"doctor"}, &stdout, &stderr, Environment{
+		Home:   home,
+		Getenv: func(string) string { return "" },
+	})
+	if code != ExitConfigError || !strings.Contains(stderr.String(), "[FAIL] configuration: age.recovery.identity_ref") {
+		t.Fatalf("doctor exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), invalidReference) || strings.Contains(stderr.String(), invalidReference) {
+		t.Fatal("doctor configuration error exposed the recovery identity reference")
+	}
+}
+
 func TestYubiKeyStateDistinguishesMissingFromProbeFailure(t *testing.T) {
 	state, count := yubiKeyState(0, nil)
 	if state != "not_detected" || count != 0 {
@@ -164,6 +250,7 @@ func TestLastSignFailureClassAcceptsCanceledState(t *testing.T) {
 func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	signAt := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	routeAt := signAt.Add(-time.Minute)
+	ageAt := signAt.Add(time.Minute)
 	persisted := state.State{
 		PID:               4242,
 		ProviderState:     "loaded",
@@ -175,6 +262,9 @@ func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 		FallbackChecked:   true,
 		FallbackReachable: true,
 		FallbackKeyFound:  true,
+		AgeBackend:        "recovery",
+		AgeResult:         "success",
+		LastAgeAt:         ageAt,
 	}
 	stale := Status{ProviderState: "not_loaded"}
 	mergePersistedState(&stale, persisted, false)
@@ -187,6 +277,9 @@ func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	if stale.AgentRoute != "" || stale.RouteProbeState != "" || stale.FallbackChecked || stale.FallbackReachable || stale.FallbackKeyFound {
 		t.Fatalf("stale route metadata was presented as current: %+v", stale)
 	}
+	if stale.AgeBackend != "" || stale.AgeResult != "" || stale.LastAgeAt != "" {
+		t.Fatalf("stale age operation was presented as current: %+v", stale)
+	}
 
 	current := Status{ProviderState: "not_loaded"}
 	mergePersistedState(&current, persisted, true)
@@ -196,6 +289,9 @@ func TestMergePersistedStateRejectsStaleRuntimeData(t *testing.T) {
 	if current.AgentRoute != "1password" || current.RouteProbeState != "not_detected" ||
 		current.RouteChangedAt != routeAt.Format(time.RFC3339) || !current.FallbackChecked || !current.FallbackReachable || !current.FallbackKeyFound {
 		t.Fatalf("current route status = %+v", current)
+	}
+	if current.AgeBackend != "recovery" || current.AgeResult != "success" || current.LastAgeAt != ageAt.Format(time.RFC3339) {
+		t.Fatalf("current age status = %+v", current)
 	}
 }
 

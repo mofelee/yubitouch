@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/agehelper"
+	"github.com/mofelee/yubitouch/internal/ageipc"
 	"github.com/mofelee/yubitouch/internal/agentproxy"
 	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/ageprobe"
+	"github.com/mofelee/yubitouch/internal/ageprofile"
+	"github.com/mofelee/yubitouch/internal/ageservice"
 	"github.com/mofelee/yubitouch/internal/backend"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/diagnostic"
@@ -39,6 +45,14 @@ func Run(ctx context.Context, options Options) error {
 	cfg, err := config.Load(options.ConfigPath, options.Home)
 	if err != nil {
 		return err
+	}
+	var ageRequestTimeout time.Duration
+	if cfg.Age != nil {
+		var ok bool
+		ageRequestTimeout, ok = config.SignTimeoutWithMargin(cfg.SignTimeout.Duration, 10*time.Second)
+		if !ok {
+			return errors.New("invalid sign_timeout")
+		}
 	}
 	if err := agentroute.FailClosedBeforeStart(cfg); err != nil {
 		return fmt.Errorf("fail closed before daemon start: %w", err)
@@ -87,6 +101,16 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventProxyListening, diagnostic.FailureNone)
+	var ageListener net.Listener
+	if cfg.Age != nil {
+		ageListener, err = ageipc.Listen(cfg.AgeSocketPath)
+		if err != nil {
+			_ = listener.Close()
+			_ = logger.Write(diagnostic.LevelError, diagnostic.EventDaemonFailed, diagnostic.Classify(err))
+			return err
+		}
+		_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventAgeIPCListening, diagnostic.FailureNone)
+	}
 	var probeEvents <-chan struct{}
 	if deviceMonitor != nil {
 		probeEvents = deviceMonitor.Events()
@@ -113,23 +137,26 @@ func Run(ctx context.Context, options Options) error {
 	if err := router.Initialize(); err != nil {
 		_ = router.FailClosed()
 		_ = listener.Close()
+		if ageListener != nil {
+			_ = ageListener.Close()
+		}
 		_ = logger.Write(diagnostic.LevelError, diagnostic.EventDaemonFailed, diagnostic.Classify(err))
 		return fmt.Errorf("initialize agent route: %w", err)
 	}
-	var routerService, serverService *backgroundService
+	var routerService, serverService, ageServerService *backgroundService
 	shutdownComplete := false
 	defer func() {
 		if shutdownComplete {
 			return
 		}
-		if routerService != nil {
-			routerService.stop()
-		}
-		_ = router.FailClosed()
-		if serverService != nil {
-			serverService.stop()
-		}
-		_ = listener.Close()
+		_ = shutdownServices(
+			routerService,
+			router.FailClosed,
+			serverService,
+			ageServerService,
+			listenerCloser(listener),
+			listenerCloser(ageListener),
+		)
 	}()
 
 	app := options.Application
@@ -146,14 +173,52 @@ func Run(ctx context.Context, options Options) error {
 		BackendFactory: manager.Connect,
 		Coordinator:    coordinator,
 	}
-	serviceResult := make(chan error, 2)
+	serviceCount := 2
+	if ageListener != nil {
+		serviceCount++
+	}
+	serviceResult := make(chan error, serviceCount)
 	serviceParent := context.WithoutCancel(ctx)
 	serverService = startBackgroundService(serviceParent, serviceResult, func(ctx context.Context) error {
 		return server.Serve(ctx, listener)
 	})
 	routerService = startBackgroundService(serviceParent, serviceResult, router.Run)
+	if ageListener != nil {
+		publicProbe := ageprobe.NewRunner(options.Executable, options.ConfigPath, 5*time.Second)
+		ageService := ageservice.New(ageservice.Options{
+			Config:      cfg,
+			Probe:       publicProbe,
+			Coordinator: coordinator,
+			NewRunner: func(path ageprofile.Path) ageservice.Runner {
+				mode := agehelper.ModeHardware
+				if path == ageprofile.PathRecovery {
+					mode = agehelper.ModeRecovery
+				}
+				return &ageRunner{
+					mode:   mode,
+					runner: agehelper.NewRunner(options.Executable, options.ConfigPath, cfg.SignTimeout.Duration),
+				}
+			},
+			Sink: ageSink{store, diagnostic.NewAgeSink(logger)},
+		})
+		ageServer := &ageipc.Server{
+			Handler:        ageService,
+			MaxConcurrent:  4,
+			RequestTimeout: ageRequestTimeout,
+		}
+		ageServerService = startBackgroundService(serviceParent, serviceResult, func(ctx context.Context) error {
+			return ageServer.Serve(ctx, ageListener)
+		})
+	}
 	err = app.Run(ctx, serviceResult)
-	shutdownErr := shutdownServices(routerService, router.FailClosed, serverService, listener.Close)
+	shutdownErr := shutdownServices(
+		routerService,
+		router.FailClosed,
+		serverService,
+		ageServerService,
+		listenerCloser(listener),
+		listenerCloser(ageListener),
+	)
 	shutdownComplete = true
 	err = errors.Join(err, shutdownErr)
 	if err != nil {
@@ -162,6 +227,111 @@ func Run(ctx context.Context, options Options) error {
 	}
 	_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventDaemonStopped, diagnostic.FailureNone)
 	return nil
+}
+
+type ageRunner struct {
+	mode   agehelper.Mode
+	runner *agehelper.Runner
+	call   *agehelper.Call
+}
+
+func (r *ageRunner) Start(ctx context.Context, envelope ageprofile.Envelope) ageipc.ErrorClass {
+	if r == nil || r.runner == nil || r.call != nil {
+		return ageipc.ClassInternal
+	}
+	call, err := r.runner.Start(ctx, r.mode, agehelper.Request{Envelope: envelope})
+	if err != nil {
+		return mapHelperError(r.mode, agehelper.ErrorClassOf(err))
+	}
+	r.call = call
+	return ""
+}
+
+func (r *ageRunner) WaitReady() ageipc.ErrorClass {
+	if r == nil || r.mode != agehelper.ModeHardware || r.call == nil {
+		return ageipc.ClassInternal
+	}
+	if err := r.call.WaitReady(); err != nil {
+		r.call = nil
+		return mapHelperError(r.mode, agehelper.ErrorClassOf(err))
+	}
+	return ""
+}
+
+func (r *ageRunner) Wait() ([]byte, ageipc.ErrorClass) {
+	if r == nil || r.call == nil {
+		return nil, ageipc.ClassInternal
+	}
+	call := r.call
+	r.call = nil
+	var fileKey []byte
+	var err error
+	if r.mode == agehelper.ModeHardware {
+		fileKey, err = call.ContinueAndWait()
+	} else {
+		fileKey, err = call.Wait()
+	}
+	if err != nil {
+		agehelper.ClearSecret(fileKey)
+		return nil, mapHelperError(r.mode, agehelper.ErrorClassOf(err))
+	}
+	if len(fileKey) != 16 {
+		agehelper.ClearSecret(fileKey)
+		return nil, helperFailureClass(r.mode)
+	}
+	result := append([]byte(nil), fileKey...)
+	agehelper.ClearSecret(fileKey)
+	return result, ""
+}
+
+func (r *ageRunner) CancelCurrent() {
+	if r != nil && r.runner != nil {
+		r.runner.CancelCurrent()
+	}
+}
+
+func mapHelperError(mode agehelper.Mode, class agehelper.ErrorClass) ageipc.ErrorClass {
+	switch class {
+	case agehelper.ErrorInvalidRequest:
+		return ageipc.ClassInvalidRequest
+	case agehelper.ErrorConfiguration:
+		return ageipc.ClassConfiguration
+	case agehelper.ErrorPINProvider, agehelper.ErrorHardwarePIN:
+		return ageipc.ClassPINFailed
+	case agehelper.ErrorHardwareMismatch:
+		return ageipc.ClassTargetMismatch
+	case agehelper.ErrorHardware:
+		return ageipc.ClassHardwareFailed
+	case agehelper.ErrorRecoveryUnavailable:
+		return ageipc.ClassRecoveryUnavailable
+	case agehelper.ErrorRecoveryMismatch:
+		return ageipc.ClassRecoveryFailed
+	case agehelper.ErrorCanceled:
+		return ageipc.ClassCanceled
+	case agehelper.ErrorTimeout:
+		return ageipc.ClassTimeout
+	case agehelper.ErrorUnwrap, agehelper.ErrorHelper:
+		return helperFailureClass(mode)
+	default:
+		return ageipc.ClassInternal
+	}
+}
+
+func helperFailureClass(mode agehelper.Mode) ageipc.ErrorClass {
+	if mode == agehelper.ModeRecovery {
+		return ageipc.ClassRecoveryFailed
+	}
+	return ageipc.ClassHardwareFailed
+}
+
+type ageSink []ageservice.Sink
+
+func (s ageSink) HandleAge(event ageservice.Event) {
+	for _, sink := range s {
+		if sink != nil {
+			sink.HandleAge(event)
+		}
+	}
 }
 
 type backgroundService struct {
@@ -184,7 +354,21 @@ func startBackgroundService(
 }
 
 func (s *backgroundService) stop() {
+	s.requestStop()
+	s.wait()
+}
+
+func (s *backgroundService) requestStop() {
+	if s == nil {
+		return
+	}
 	s.cancel()
+}
+
+func (s *backgroundService) wait() {
+	if s == nil {
+		return
+	}
 	<-s.done
 }
 
@@ -192,12 +376,32 @@ func shutdownServices(
 	router *backgroundService,
 	failClosed func() error,
 	server *backgroundService,
+	ageServer *backgroundService,
 	closeListener func() error,
+	closeAgeListener func() error,
 ) error {
 	router.stop()
 	routeErr := failClosed()
-	server.stop()
-	return errors.Join(routeErr, closeListener())
+	// Cancel queued age work before releasing an active SSH operation from the
+	// shared PIV coordinator. No new PIN, UI, or helper work may start during shutdown.
+	ageServer.requestStop()
+	server.requestStop()
+	ageServer.wait()
+	server.wait()
+	return errors.Join(routeErr, closeListener(), closeAgeListener())
+}
+
+func listenerCloser(listener net.Listener) func() error {
+	if listener == nil {
+		return func() error { return nil }
+	}
+	return func() error {
+		err := listener.Close()
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 func OptionsFromOS(configPath string, home string) (Options, error) {

@@ -3,9 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -14,7 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/agehelper"
+	"github.com/mofelee/yubitouch/internal/ageipc"
+	"github.com/mofelee/yubitouch/internal/agentproxy"
 	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/ageprofile"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/signing"
 	"github.com/mofelee/yubitouch/internal/state"
@@ -92,6 +99,71 @@ func TestDaemonRecoversPublicSocketAfterCrash(t *testing.T) {
 		t.Fatalf("daemon PID was reused: %d", secondPID)
 	}
 	assertDaemonStatePID(t, configPath, secondPID)
+}
+
+func TestDaemonRecoversAgeSocketAfterCrash(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "yt-daemon-age-recovery-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	configPath, cfg := writeDaemonTestConfig(t, dir)
+	scalar := bytes.Repeat([]byte{0x5a}, 32)
+	privateKey, err := ecdh.X25519().NewPrivateKey(scalar)
+	clear(scalar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Age = &config.AgeConfig{
+		Serial:    "123456",
+		Slot:      "82",
+		Algorithm: "x25519",
+		PublicKey: base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()),
+	}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	ageSocket := filepath.Join(filepath.Dir(configPath), "age.sock")
+
+	first := startDaemonHelper(t, dir, configPath)
+	t.Cleanup(func() { first.killAndWait(t) })
+	waitForDaemonSocket(t, cfg.SocketPath, first)
+	waitForDaemonSocket(t, ageSocket, first)
+	first.killAndWait(t)
+	if info, err := os.Lstat(ageSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("crash did not leave the age socket: info=%v err=%v", info, err)
+	}
+
+	second := startDaemonHelper(t, dir, configPath)
+	t.Cleanup(func() { second.killAndWait(t) })
+	waitForDaemonSocket(t, cfg.SocketPath, second)
+	waitForDaemonSocket(t, ageSocket, second)
+}
+
+func TestMapHelperErrorUsesOnlyPredefinedIPCClasses(t *testing.T) {
+	tests := []struct {
+		mode  agehelper.Mode
+		class agehelper.ErrorClass
+		want  ageipc.ErrorClass
+	}{
+		{agehelper.ModeHardware, agehelper.ErrorInvalidRequest, ageipc.ClassInvalidRequest},
+		{agehelper.ModeHardware, agehelper.ErrorConfiguration, ageipc.ClassConfiguration},
+		{agehelper.ModeHardware, agehelper.ErrorPINProvider, ageipc.ClassPINFailed},
+		{agehelper.ModeHardware, agehelper.ErrorHardwarePIN, ageipc.ClassPINFailed},
+		{agehelper.ModeHardware, agehelper.ErrorHardwareMismatch, ageipc.ClassTargetMismatch},
+		{agehelper.ModeHardware, agehelper.ErrorUnwrap, ageipc.ClassHardwareFailed},
+		{agehelper.ModeRecovery, agehelper.ErrorRecoveryUnavailable, ageipc.ClassRecoveryUnavailable},
+		{agehelper.ModeRecovery, agehelper.ErrorRecoveryMismatch, ageipc.ClassRecoveryFailed},
+		{agehelper.ModeRecovery, agehelper.ErrorUnwrap, ageipc.ClassRecoveryFailed},
+		{agehelper.ModeRecovery, agehelper.ErrorCanceled, ageipc.ClassCanceled},
+		{agehelper.ModeRecovery, agehelper.ErrorTimeout, ageipc.ClassTimeout},
+		{agehelper.ModeRecovery, agehelper.ErrorClass("op://private/reference"), ageipc.ClassInternal},
+	}
+	for _, test := range tests {
+		if got := mapHelperError(test.mode, test.class); got != test.want {
+			t.Fatalf("mapHelperError(%q, %q) = %q, want %q", test.mode, test.class, got, test.want)
+		}
+	}
 }
 
 type daemonHelper struct {
@@ -260,10 +332,12 @@ func TestShutdownServicesWaitsBeforeFailClosedAndListenerClose(t *testing.T) {
 			return nil
 		},
 		server,
+		nil,
 		func() error {
 			order = append(order, "listener_closed")
 			return nil
 		},
+		func() error { return nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -271,6 +345,146 @@ func TestShutdownServicesWaitsBeforeFailClosedAndListenerClose(t *testing.T) {
 	want := []string{"router_stopped", "route_fail_closed", "server_stopped", "listener_closed"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
 		t.Fatalf("shutdown order = %v, want %v", order, want)
+	}
+}
+
+func TestShutdownCancelsAgeBeforeWaitingForSSHServer(t *testing.T) {
+	results := make(chan error, 3)
+	router := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		<-ctx.Done()
+		return nil
+	})
+	serverCanceled := make(chan struct{})
+	releaseServer := make(chan struct{})
+	server := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		<-ctx.Done()
+		close(serverCanceled)
+		<-releaseServer
+		return nil
+	})
+	ageCanceled := make(chan struct{})
+	ageServer := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		<-ctx.Done()
+		close(ageCanceled)
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- shutdownServices(
+			router,
+			func() error { return nil },
+			server,
+			ageServer,
+			func() error { return nil },
+			func() error { return nil },
+		)
+	}()
+	select {
+	case <-ageCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for SSH before canceling queued age work")
+	}
+	select {
+	case <-serverCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel SSH server")
+	}
+	close(releaseServer)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not finish")
+	}
+}
+
+func TestShutdownAcceptsAlreadyClosedUnixListeners(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "yt-shutdown-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sshListener, err := net.Listen("unix", filepath.Join(dir, "ssh.sock"))
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+	ageListener, err := net.Listen("unix", filepath.Join(dir, "age.sock"))
+	if err != nil {
+		_ = sshListener.Close()
+		if errors.Is(err, os.ErrPermission) {
+			t.Skip("sandbox does not permit Unix socket creation")
+		}
+		t.Fatal(err)
+	}
+
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshServer := &agentproxy.Server{
+		TargetKey: target,
+		BackendFactory: func(context.Context) (agentproxy.Backend, error) {
+			return nil, errors.New("unused test backend")
+		},
+		Coordinator: signing.New(nil, nil, time.Second),
+	}
+	ageServer := &ageipc.Server{
+		Handler: ageipc.HandlerFunc(func(context.Context, signing.Requester, ageprofile.UnwrapRequest) ([]byte, ageipc.ErrorClass) {
+			return nil, ageipc.ClassInternal
+		}),
+	}
+	results := make(chan error, 2)
+	sshService := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		return sshServer.Serve(ctx, sshListener)
+	})
+	ageService := startBackgroundService(context.Background(), results, func(ctx context.Context) error {
+		return ageServer.Serve(ctx, ageListener)
+	})
+
+	err = shutdownServices(
+		nil,
+		func() error { return nil },
+		sshService,
+		ageService,
+		listenerCloser(sshListener),
+		listenerCloser(ageListener),
+	)
+	if err != nil {
+		t.Fatalf("normal Unix listener shutdown failed: %v", err)
+	}
+}
+
+type closeErrorListener struct {
+	err error
+}
+
+func (l closeErrorListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (l closeErrorListener) Close() error              { return l.err }
+func (closeErrorListener) Addr() net.Addr              { return &net.UnixAddr{Name: "test", Net: "unix"} }
+
+func TestListenerCloserIgnoresOnlyClosedErrors(t *testing.T) {
+	wrappedClosed := closeErrorListener{err: errors.New("close: " + net.ErrClosed.Error())}
+	if err := listenerCloser(wrappedClosed)(); err == nil {
+		t.Fatal("non-wrapping lookalike net.ErrClosed error was ignored")
+	}
+
+	wrappedClosed.err = fmt.Errorf("close: %w", net.ErrClosed)
+	if err := listenerCloser(wrappedClosed)(); err != nil {
+		t.Fatalf("wrapped net.ErrClosed was returned: %v", err)
+	}
+
+	want := errors.New("close failed")
+	if err := listenerCloser(closeErrorListener{err: want})(); !errors.Is(err, want) {
+		t.Fatalf("listener close error = %v, want %v", err, want)
 	}
 }
 

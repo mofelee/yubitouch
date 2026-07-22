@@ -26,18 +26,36 @@ func (a *App) SetCancelHandler(handler func(uint64) bool) {
 
 func (a *App) Handle(event signing.Event) {
 	name := requesterName(event.Requester)
+	action := operationAction(event.Operation)
 	switch event.Type {
 	case signing.EventWaiting:
-		macos.ShowWaiting(a.sound, name+" 正在请求 SSH 签名", waitingSubtitle(event.Requester), event.Requester.BundleIdentifier, event.RequestID)
+		macos.ShowWaiting(a.sound, name+" 正在请求 "+action, waitingSubtitle(event.Requester), event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventSuccess:
-		macos.ShowSuccess(name+" 的请求已授权", event.Requester.BundleIdentifier, event.RequestID)
+		macos.ShowSuccess(name+" 的"+action+"已授权", event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventTimeout:
-		macos.ShowFailure(name+" 的请求超时", "签名等待超时，请重试", event.Requester.BundleIdentifier, event.RequestID)
+		macos.ShowFailure(name+" 的请求超时", action+"等待超时，请重试", event.Requester.BundleIdentifier, event.RequestID)
 	case signing.EventCanceled:
 		macos.Hide(event.RequestID)
 	case signing.EventFailure:
-		macos.ShowFailure(name+" 的请求失败", signFailureMessage(event.Err), event.Requester.BundleIdentifier, event.RequestID)
+		macos.ShowFailure(name+" 的请求失败", operationFailureMessage(event.Operation, event.Err), event.Requester.BundleIdentifier, event.RequestID)
 	}
+}
+
+func operationAction(operation signing.Operation) string {
+	if operation == signing.OperationAgeDecrypt {
+		return "age 解密"
+	}
+	return "SSH 签名"
+}
+
+func operationFailureMessage(operation signing.Operation, err error) string {
+	if operation == signing.OperationAgeDecrypt {
+		if errors.Is(err, signing.ErrDeviceUnavailable) {
+			return "YubiKey 已断开，请重新连接"
+		}
+		return "age 解密失败，请检查 YubiKey 后重试"
+	}
+	return signFailureMessage(err)
 }
 
 func requesterName(requester signing.Requester) string {

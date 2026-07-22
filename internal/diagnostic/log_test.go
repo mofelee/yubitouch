@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/ageipc"
+	"github.com/mofelee/yubitouch/internal/ageservice"
 	"github.com/mofelee/yubitouch/internal/signing"
 )
 
@@ -98,6 +100,40 @@ func TestSigningSinkRecordsClassifiedCancellation(t *testing.T) {
 	contents := string(data)
 	if !strings.Contains(contents, `"event":"sign_canceled"`) || !strings.Contains(contents, `"failure_class":"canceled"`) {
 		t.Fatalf("cancellation was not classified: %s", contents)
+	}
+}
+
+func TestAgeSinksRecordOnlyClassifiedEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yubitouch.log")
+	logger, err := Open(path, "debug")
+	if err != nil {
+		t.Fatal(err)
+	}
+	NewSigningSink(logger).Handle(signing.Event{
+		Type:      signing.EventWaiting,
+		Operation: signing.OperationAgeDecrypt,
+		Err:       errors.New("op://private/reference AGE-SECRET-KEY-private"),
+	})
+	ageSink := NewAgeSink(logger)
+	ageSink.HandleAge(ageservice.Event{Backend: ageservice.BackendRecovery, Result: ageservice.ResultStarted})
+	ageSink.HandleAge(ageservice.Event{Backend: ageservice.BackendRecovery, Result: ageservice.Result(ageipc.ClassRecoveryFailed)})
+	if err := logger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	for _, secret := range []string{"op://", "private/reference", "AGE-SECRET-KEY"} {
+		if strings.Contains(contents, secret) {
+			t.Fatalf("age diagnostic log leaked %q: %s", secret, contents)
+		}
+	}
+	for _, event := range []Event{EventAgeWaiting, EventAgeRecovery, EventAgeFailed} {
+		if !strings.Contains(contents, `"event":"`+string(event)+`"`) {
+			t.Fatalf("age event %q missing: %s", event, contents)
+		}
 	}
 }
 

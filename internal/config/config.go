@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,15 +14,20 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	onepassword "github.com/1password/onepassword-sdk-go"
+	"github.com/mofelee/yubitouch/internal/ageprofile"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	DefaultSound       = "Glass"
 	DefaultSignTimeout = 60 * time.Second
+	MaxSignTimeout     = time.Hour
 	DefaultLogLevel    = "info"
 )
 
@@ -53,9 +60,37 @@ type Config struct {
 	Sound               string        `json:"sound"`
 	SignTimeout         Duration      `json:"sign_timeout"`
 	LogLevel            string        `json:"log_level"`
+	Age                 *AgeConfig    `json:"age,omitempty"`
 
-	PublicKey ssh.PublicKey `json:"-"`
+	PublicKey     ssh.PublicKey `json:"-"`
+	AgeSocketPath string        `json:"-"`
 }
+
+type AgeConfig struct {
+	Serial    string       `json:"serial"`
+	Slot      string       `json:"slot"`
+	Algorithm string       `json:"algorithm"`
+	PublicKey string       `json:"public_key,omitempty"`
+	Recovery  *AgeRecovery `json:"recovery,omitempty"`
+}
+
+type AgeRecovery struct {
+	Provider    string `json:"provider"`
+	IdentityRef string `json:"identity_ref"`
+	Recipient   string `json:"recipient"`
+}
+
+type AgeTarget struct {
+	Serial    string
+	Slot      string
+	Algorithm string
+}
+
+var (
+	ErrAgeConfigurationChanged = errors.New("age configuration changed while reading the hardware public key")
+	ErrConfigurationWrite      = errors.New("configuration write failed")
+	configProcessLock          sync.Mutex
+)
 
 type Duration struct {
 	time.Duration
@@ -78,6 +113,17 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// SignTimeoutWithMargin adds a protocol margin without allowing duration
+// overflow. Callers still validate the configured timeout against
+// MaxSignTimeout at the configuration boundary.
+func SignTimeoutWithMargin(timeout, margin time.Duration) (time.Duration, bool) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if timeout <= 0 || margin < 0 || timeout > maxDuration-margin {
+		return 0, false
+	}
+	return timeout + margin, true
+}
+
 func DefaultPath(home string) string {
 	return filepath.Join(home, ".ssh", "yubitouch", "config.json")
 }
@@ -91,6 +137,7 @@ func Defaults(home string) Config {
 		SocketPath:        filepath.Join(runtimeDir, "agent.sock"),
 		PIVSocketPath:     filepath.Join(runtimeDir, "piv-agent.sock"),
 		BackendSocketPath: filepath.Join(runtimeDir, "backend.sock"),
+		AgeSocketPath:     filepath.Join(runtimeDir, "age.sock"),
 		Sound:             DefaultSound,
 		SignTimeout:       Duration{Duration: DefaultSignTimeout},
 		LogLevel:          DefaultLogLevel,
@@ -119,6 +166,7 @@ func Load(path string, home string) (Config, error) {
 	if err := decodeStrict(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	}
+	setAgeSocketPath(&cfg, path, home)
 	if err := cfg.ResolveAndValidate(home); err != nil {
 		return Config{}, err
 	}
@@ -128,6 +176,15 @@ func Load(path string, home string) (Config, error) {
 func LoadForConfigure(path string, home string, getenv func(string) string) (Config, error) {
 	if strings.TrimSpace(getenv("YUBITOUCH_PIN")) != "" {
 		return Config{}, errors.New("YUBITOUCH_PIN is forbidden; PIN values must never be placed in the environment")
+	}
+	for _, name := range []string{
+		"YUBITOUCH_AGE_RECOVERY_IDENTITY",
+		"YUBITOUCH_AGE_RECOVERY_PRIVATE_KEY",
+		"YUBITOUCH_AGE_RECOVERY_SECRET",
+	} {
+		if strings.TrimSpace(getenv(name)) != "" {
+			return Config{}, fmt.Errorf("%s is forbidden; recovery private keys must never be placed in the environment", name)
+		}
 	}
 	cfg := Defaults(home)
 	if err := validatePrivateFile(path); err == nil {
@@ -142,13 +199,75 @@ func LoadForConfigure(path string, home string, getenv func(string) string) (Con
 		return Config{}, err
 	}
 	applyEnvironment(&cfg, getenv)
+	setAgeSocketPath(&cfg, path, home)
 	if err := cfg.ResolveAndValidate(home); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
+// Configure serializes the read-modify-write sequence used by the configure
+// command with other configuration writers.
+func Configure(path string, home string, getenv func(string) string) (Config, error) {
+	var cfg Config
+	var loadFailed bool
+	err := withConfigLock(path, func() error {
+		loaded, err := LoadForConfigure(path, home, getenv)
+		if err != nil {
+			loadFailed = true
+			return err
+		}
+		if err := saveUnlocked(path, loaded); err != nil {
+			return fmt.Errorf("%w: %v", ErrConfigurationWrite, err)
+		}
+		cfg = loaded
+		return nil
+	})
+	if err != nil && !loadFailed && !errors.Is(err, ErrConfigurationWrite) {
+		err = fmt.Errorf("%w: %v", ErrConfigurationWrite, err)
+	}
+	return cfg, err
+}
+
 func Save(path string, cfg Config) error {
+	return withConfigLock(path, func() error {
+		return saveUnlocked(path, cfg)
+	})
+}
+
+// CacheAgePublicKey updates only the cache field in the latest configuration.
+// It fails closed if the hardware target changed while the key was being read.
+func CacheAgePublicKey(path string, home string, expected AgeTarget, publicKey ageprofile.PublicKey) (Config, error) {
+	var result Config
+	err := withConfigLock(path, func() error {
+		cfg, err := Load(path, home)
+		if err != nil {
+			return err
+		}
+		if cfg.Age == nil || cfg.Age.Serial != expected.Serial || cfg.Age.Slot != expected.Slot || cfg.Age.Algorithm != expected.Algorithm {
+			return ErrAgeConfigurationChanged
+		}
+
+		encoded := base64.RawURLEncoding.EncodeToString(publicKey[:])
+		if cfg.Age.PublicKey != "" && cfg.Age.PublicKey != encoded {
+			return ErrAgeConfigurationChanged
+		}
+		if cfg.Age.PublicKey == "" {
+			cfg.Age.PublicKey = encoded
+			if err := cfg.resolveAndValidateAge(); err != nil {
+				return err
+			}
+			if err := saveUnlocked(path, cfg); err != nil {
+				return err
+			}
+		}
+		result = cfg
+		return nil
+	})
+	return result, err
+}
+
+func saveUnlocked(path string, cfg Config) error {
 	dir := filepath.Dir(path)
 	if err := EnsurePrivateDir(dir); err != nil {
 		return err
@@ -186,6 +305,40 @@ func Save(path string, cfg Config) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+func withConfigLock(path string, fn func() error) error {
+	configProcessLock.Lock()
+	defer configProcessLock.Unlock()
+
+	if err := EnsurePrivateDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	lockPath := path + ".lock"
+	fd, err := unix.Open(lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
+	if err != nil {
+		return fmt.Errorf("open configuration lock: %w", err)
+	}
+	defer unix.Close(fd)
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return fmt.Errorf("inspect configuration lock: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || int(stat.Uid) != os.Getuid() || stat.Mode&0o777 != 0o600 {
+		return errors.New("configuration lock must be a 0600 regular file owned by the current user")
+	}
+	for {
+		err = unix.Flock(fd, unix.LOCK_EX)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("lock configuration: %w", err)
+	}
+	defer unix.Flock(fd, unix.LOCK_UN)
+	return fn()
 }
 
 func EnsurePrivateDir(path string) error {
@@ -272,6 +425,10 @@ func (c *Config) ResolveAndValidate(home string) error {
 	c.SocketPath = expandPath(c.SocketPath, home)
 	c.PIVSocketPath = expandPath(c.PIVSocketPath, home)
 	c.BackendSocketPath = expandPath(c.BackendSocketPath, home)
+	if strings.TrimSpace(c.AgeSocketPath) == "" {
+		c.AgeSocketPath = filepath.Join(filepath.Dir(DefaultPath(home)), "age.sock")
+	}
+	c.AgeSocketPath = expandPath(c.AgeSocketPath, home)
 	if c.FallbackAgent == FallbackAgent1Password && strings.TrimSpace(c.FallbackAgentSocket) == "" {
 		c.FallbackAgentSocket = defaultOnePasswordAgentSocket(home)
 	}
@@ -308,17 +465,26 @@ func (c *Config) ResolveAndValidate(home string) error {
 	if c.SignTimeout.Duration <= 0 {
 		return errors.New("sign_timeout must be greater than zero")
 	}
+	if c.SignTimeout.Duration > MaxSignTimeout {
+		return errors.New("sign_timeout must not exceed 1h")
+	}
 	if c.LogLevel != "error" && c.LogLevel != "info" && c.LogLevel != "debug" {
 		return fmt.Errorf("invalid log_level %q", c.LogLevel)
 	}
+	if err := c.resolveAndValidateAge(); err != nil {
+		return err
+	}
 	managed := []string{c.SocketPath, c.PIVSocketPath, c.BackendSocketPath}
+	if c.Age != nil {
+		managed = append(managed, c.AgeSocketPath)
+	}
 	for i := range managed {
 		if strings.TrimSpace(managed[i]) == "" {
-			return errors.New("socket, piv_socket, and backend_socket are required")
+			return errors.New("socket, piv_socket, backend_socket, and age socket are required")
 		}
 		for j := 0; j < i; j++ {
 			if managed[i] == managed[j] {
-				return errors.New("socket, piv_socket, and backend_socket must be different")
+				return errors.New("socket, piv_socket, backend_socket, and age socket must be different")
 			}
 		}
 	}
@@ -340,11 +506,95 @@ func (c *Config) ResolveAndValidate(home string) error {
 		if len(c.BackendSocketPath) >= 104 {
 			return fmt.Errorf("backend_socket path is too long for macOS: %s", c.BackendSocketPath)
 		}
+		if c.Age != nil && len(c.AgeSocketPath) >= 104 {
+			return fmt.Errorf("age socket path is too long for macOS: %s", c.AgeSocketPath)
+		}
 		if len(c.FallbackAgentSocket) >= 104 {
 			return fmt.Errorf("fallback_agent_socket path is too long for macOS: %s", c.FallbackAgentSocket)
 		}
 	}
 	return nil
+}
+
+func (c *Config) resolveAndValidateAge() error {
+	if c.Age == nil {
+		return nil
+	}
+	serial := c.Age.Serial
+	parsedSerial, err := strconv.ParseUint(serial, 10, 32)
+	if err != nil || parsedSerial == 0 || strconv.FormatUint(parsedSerial, 10) != serial {
+		return errors.New("age.serial must be a canonical non-zero uint32")
+	}
+
+	slot := strings.ToLower(strings.TrimSpace(c.Age.Slot))
+	if !validAgeSlot(slot) {
+		return fmt.Errorf("invalid age.slot %q", c.Age.Slot)
+	}
+	c.Age.Slot = slot
+	if c.Age.Algorithm != "x25519" {
+		return fmt.Errorf("invalid age.algorithm %q; only x25519 is supported", c.Age.Algorithm)
+	}
+	var hardwarePublicKey *ageprofile.PublicKey
+	if c.Age.PublicKey != "" {
+		publicKey, err := base64.RawURLEncoding.DecodeString(c.Age.PublicKey)
+		if err != nil || len(publicKey) != 32 || base64.RawURLEncoding.EncodeToString(publicKey) != c.Age.PublicKey {
+			return errors.New("age.public_key must be canonical unpadded base64url encoding of 32 bytes")
+		}
+		var key ageprofile.PublicKey
+		copy(key[:], publicKey)
+		if _, err := ageprofile.NewRecipient(key, nil); err != nil {
+			return errors.New("age.public_key must encode a valid canonical X25519 public key")
+		}
+		hardwarePublicKey = &key
+	}
+	if c.Age.Recovery == nil {
+		return nil
+	}
+
+	recovery := c.Age.Recovery
+	if recovery.Provider != "1password" {
+		return fmt.Errorf("invalid age.recovery.provider %q; only 1password is supported", recovery.Provider)
+	}
+	if strings.TrimSpace(c.OnePasswordAccount) == "" {
+		return errors.New("onepassword_account is required for age recovery")
+	}
+	if err := ValidateAgeRecoveryIdentityReference(context.Background(), recovery.IdentityRef); err != nil {
+		return err
+	}
+	recoveryPublicKey, err := ageprofile.ParseNativeRecipient(recovery.Recipient)
+	if err != nil {
+		return errors.New("age.recovery.recipient must be a canonical native age X25519 recipient")
+	}
+	if hardwarePublicKey != nil {
+		if _, err := ageprofile.NewRecipient(*hardwarePublicKey, &recoveryPublicKey); err != nil {
+			return errors.New("age.public_key and age.recovery.recipient must use independent X25519 public keys")
+		}
+	}
+	return nil
+}
+
+// ValidateAgeRecoveryIdentityReference validates syntax only. It never resolves
+// the referenced recovery identity and intentionally discards SDK error details.
+func ValidateAgeRecoveryIdentityReference(ctx context.Context, reference string) error {
+	if strings.TrimSpace(reference) != reference {
+		return errors.New("age.recovery.identity_ref must be a valid 1Password secret reference")
+	}
+	if err := onepassword.Secrets.ValidateSecretReference(ctx, reference); err != nil {
+		return errors.New("age.recovery.identity_ref must be a valid 1Password secret reference")
+	}
+	return nil
+}
+
+func validAgeSlot(slot string) bool {
+	switch slot {
+	case "9a", "9c", "9d", "9e":
+		return true
+	}
+	if len(slot) != 2 {
+		return false
+	}
+	value, err := strconv.ParseUint(slot, 16, 8)
+	return err == nil && value >= 0x82 && value <= 0x95
 }
 
 func (c Config) Fingerprint() string {
@@ -398,6 +648,50 @@ func applyEnvironment(cfg *Config, getenv func(string) string) {
 	setString("YUBITOUCH_FALLBACK_AGENT_SOCKET", &cfg.FallbackAgentSocket)
 	setString("YUBITOUCH_SOUND", &cfg.Sound)
 	setString("YUBITOUCH_LOG_LEVEL", &cfg.LogLevel)
+	ageValues := map[string]string{
+		"serial":                strings.TrimSpace(getenv("YUBITOUCH_AGE_SERIAL")),
+		"slot":                  strings.TrimSpace(getenv("YUBITOUCH_AGE_SLOT")),
+		"algorithm":             strings.TrimSpace(getenv("YUBITOUCH_AGE_ALGORITHM")),
+		"recovery_provider":     strings.TrimSpace(getenv("YUBITOUCH_AGE_RECOVERY_PROVIDER")),
+		"recovery_identity_ref": strings.TrimSpace(getenv("YUBITOUCH_AGE_RECOVERY_IDENTITY_REF")),
+		"recovery_recipient":    strings.TrimSpace(getenv("YUBITOUCH_AGE_RECOVERY_RECIPIENT")),
+	}
+	if ageValues["serial"] != "" || ageValues["slot"] != "" || ageValues["algorithm"] != "" ||
+		ageValues["recovery_provider"] != "" || ageValues["recovery_identity_ref"] != "" || ageValues["recovery_recipient"] != "" {
+		if cfg.Age == nil {
+			cfg.Age = &AgeConfig{}
+		}
+		targetChanged := false
+		if ageValues["serial"] != "" {
+			targetChanged = targetChanged || cfg.Age.Serial != ageValues["serial"]
+			cfg.Age.Serial = ageValues["serial"]
+		}
+		if ageValues["slot"] != "" {
+			targetChanged = targetChanged || !strings.EqualFold(cfg.Age.Slot, ageValues["slot"])
+			cfg.Age.Slot = ageValues["slot"]
+		}
+		if ageValues["algorithm"] != "" {
+			targetChanged = targetChanged || cfg.Age.Algorithm != ageValues["algorithm"]
+			cfg.Age.Algorithm = ageValues["algorithm"]
+		}
+		if targetChanged {
+			cfg.Age.PublicKey = ""
+		}
+		if ageValues["recovery_provider"] != "" || ageValues["recovery_identity_ref"] != "" || ageValues["recovery_recipient"] != "" {
+			if cfg.Age.Recovery == nil {
+				cfg.Age.Recovery = &AgeRecovery{}
+			}
+			if ageValues["recovery_provider"] != "" {
+				cfg.Age.Recovery.Provider = ageValues["recovery_provider"]
+			}
+			if ageValues["recovery_identity_ref"] != "" {
+				cfg.Age.Recovery.IdentityRef = ageValues["recovery_identity_ref"]
+			}
+			if ageValues["recovery_recipient"] != "" {
+				cfg.Age.Recovery.Recipient = ageValues["recovery_recipient"]
+			}
+		}
+	}
 	if value := strings.TrimSpace(getenv("YUBITOUCH_SIGN_TIMEOUT")); value != "" {
 		if parsed, err := time.ParseDuration(value); err == nil {
 			cfg.SignTimeout = Duration{Duration: parsed}
@@ -405,6 +699,11 @@ func applyEnvironment(cfg *Config, getenv func(string) string) {
 			cfg.SignTimeout = Duration{}
 		}
 	}
+}
+
+func setAgeSocketPath(cfg *Config, configPath string, home string) {
+	path := expandPath(configPath, home)
+	cfg.AgeSocketPath = filepath.Join(filepath.Dir(path), "age.sock")
 }
 
 func readPublicKey(path string) (ssh.PublicKey, error) {

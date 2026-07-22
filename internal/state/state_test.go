@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/ageipc"
 	"github.com/mofelee/yubitouch/internal/agentroute"
+	"github.com/mofelee/yubitouch/internal/ageservice"
 	"github.com/mofelee/yubitouch/internal/signing"
 )
 
@@ -69,6 +71,60 @@ func TestStorePersistsCanceledTerminalState(t *testing.T) {
 		loaded.LastFailureClass != "canceled" ||
 		loaded.ProviderState != "unavailable" {
 		t.Fatalf("canceled state = %+v", loaded)
+	}
+}
+
+func TestStoreKeepsAgeStateSeparateFromSSHSigningState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store.Handle(signing.Event{
+		Type:      signing.EventWaiting,
+		At:        time.Now(),
+		Operation: signing.OperationAgeDecrypt,
+	})
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LastSignEvent != "" || loaded.ProviderState != "not_loaded" {
+		t.Fatalf("age coordinator event changed SSH state: %+v", loaded)
+	}
+
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	store.HandleAge(ageservice.Event{
+		At:      now,
+		Backend: ageservice.BackendRecovery,
+		Result:  ageservice.Result(ageipc.ClassRecoveryFailed),
+	})
+	loaded, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AgeBackend != "recovery" || loaded.AgeResult != "recovery_failed" || !loaded.LastAgeAt.Equal(now) {
+		t.Fatalf("age state = %+v", loaded)
+	}
+}
+
+func TestStoreRejectsUnclassifiedAgeState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+	if err := store.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	store.HandleAge(ageservice.Event{
+		At:      time.Now(),
+		Backend: ageservice.Backend("op://private/reference"),
+		Result:  ageservice.Result("private file key"),
+	})
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AgeBackend != "" || loaded.AgeResult != "" || !loaded.LastAgeAt.IsZero() {
+		t.Fatalf("unclassified age state was persisted: %+v", loaded)
 	}
 }
 

@@ -26,6 +26,25 @@ func TestChooseRequesterUsesVerifiedTerminalBundleForSSH(t *testing.T) {
 	}
 }
 
+func TestChooseRequesterUsesAgeCallingApplication(t *testing.T) {
+	requester := chooseRequester([]processSnapshot{
+		{executable: "age-plugin-yubitouch"},
+		{executable: "age"},
+		{executable: "zsh"},
+		{
+			executable: "Terminal",
+			bundle: bundleMetadata{
+				name:       "Terminal",
+				identifier: "com.apple.Terminal",
+				verified:   true,
+			},
+		},
+	})
+	if requester.Name != "Terminal" || requester.DirectClient != "age-plugin-yubitouch" || !requester.VerifiedBundle {
+		t.Fatalf("requester = %+v", requester)
+	}
+}
+
 func TestChooseRequesterPrefersDebianFormOverTerminalAncestor(t *testing.T) {
 	requester := chooseRequester([]processSnapshot{
 		{executable: "ssh"},

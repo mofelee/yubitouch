@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mofelee/yubitouch/internal/ageipc"
+	"github.com/mofelee/yubitouch/internal/ageservice"
 	"github.com/mofelee/yubitouch/internal/config"
 	"github.com/mofelee/yubitouch/internal/signing"
 )
@@ -34,12 +36,21 @@ const (
 	EventDaemonStopped    Event = "daemon_stopped"
 	EventDaemonFailed     Event = "daemon_failed"
 	EventProxyListening   Event = "proxy_listening"
+	EventAgeIPCListening  Event = "age_ipc_listening"
 	EventSignInitializing Event = "sign_initializing"
 	EventSignWaiting      Event = "sign_waiting_for_touch"
 	EventSignSucceeded    Event = "sign_succeeded"
 	EventSignFailed       Event = "sign_failed"
 	EventSignTimedOut     Event = "sign_timed_out"
 	EventSignCanceled     Event = "sign_canceled"
+	EventAgeInitializing  Event = "age_initializing"
+	EventAgeWaiting       Event = "age_waiting_for_touch"
+	EventAgeHardware      Event = "age_hardware_selected"
+	EventAgeRecovery      Event = "age_recovery_selected"
+	EventAgeSucceeded     Event = "age_decrypt_succeeded"
+	EventAgeFailed        Event = "age_decrypt_failed"
+	EventAgeTimedOut      Event = "age_decrypt_timed_out"
+	EventAgeCanceled      Event = "age_decrypt_canceled"
 	EventRoutePIV         Event = "agent_route_piv"
 	EventRoute1Password   Event = "agent_route_1password"
 	EventRouteFailClosed  Event = "agent_route_piv_fail_closed"
@@ -205,12 +216,21 @@ func validEvent(event Event) bool {
 		EventDaemonStopped,
 		EventDaemonFailed,
 		EventProxyListening,
+		EventAgeIPCListening,
 		EventSignInitializing,
 		EventSignWaiting,
 		EventSignSucceeded,
 		EventSignFailed,
 		EventSignTimedOut,
 		EventSignCanceled,
+		EventAgeInitializing,
+		EventAgeWaiting,
+		EventAgeHardware,
+		EventAgeRecovery,
+		EventAgeSucceeded,
+		EventAgeFailed,
+		EventAgeTimedOut,
+		EventAgeCanceled,
 		EventRoutePIV,
 		EventRoute1Password,
 		EventRouteFailClosed,
@@ -313,6 +333,15 @@ func (s SigningSink) Handle(event signing.Event) {
 	if s.logger == nil {
 		return
 	}
+	if event.Operation == signing.OperationAgeDecrypt {
+		switch event.Type {
+		case signing.EventInitializing:
+			_ = s.logger.Write(LevelDebug, EventAgeInitializing, FailureNone)
+		case signing.EventWaiting:
+			_ = s.logger.Write(LevelDebug, EventAgeWaiting, FailureNone)
+		}
+		return
+	}
 	switch event.Type {
 	case signing.EventInitializing:
 		_ = s.logger.Write(LevelDebug, EventSignInitializing, FailureNone)
@@ -326,5 +355,57 @@ func (s SigningSink) Handle(event signing.Event) {
 		_ = s.logger.Write(LevelInfo, EventSignCanceled, FailureCanceled)
 	case signing.EventFailure:
 		_ = s.logger.Write(LevelError, EventSignFailed, Classify(event.Err))
+	}
+}
+
+type AgeSink struct {
+	logger *Logger
+}
+
+func NewAgeSink(logger *Logger) AgeSink {
+	return AgeSink{logger: logger}
+}
+
+func (s AgeSink) HandleAge(event ageservice.Event) {
+	if s.logger == nil {
+		return
+	}
+	if event.Result == ageservice.ResultStarted {
+		switch event.Backend {
+		case ageservice.BackendHardware:
+			_ = s.logger.Write(LevelInfo, EventAgeHardware, FailureNone)
+		case ageservice.BackendRecovery:
+			_ = s.logger.Write(LevelInfo, EventAgeRecovery, FailureNone)
+		}
+		return
+	}
+	if event.Result == ageservice.ResultSuccess {
+		_ = s.logger.Write(LevelInfo, EventAgeSucceeded, FailureNone)
+		return
+	}
+	switch event.Result {
+	case ageservice.Result(ageipc.ClassCanceled):
+		_ = s.logger.Write(LevelInfo, EventAgeCanceled, FailureCanceled)
+	case ageservice.Result(ageipc.ClassTimeout):
+		_ = s.logger.Write(LevelError, EventAgeTimedOut, FailureTimeout)
+	default:
+		_ = s.logger.Write(LevelError, EventAgeFailed, classifyAgeResult(event.Result))
+	}
+}
+
+func classifyAgeResult(result ageservice.Result) FailureClass {
+	switch result {
+	case ageservice.Result(ageipc.ClassConfiguration), ageservice.Result(ageipc.ClassInvalidRequest):
+		return FailureConfiguration
+	case ageservice.Result(ageipc.ClassDeviceNotDetected):
+		return FailureDeviceUnavailable
+	case ageservice.Result(ageipc.ClassProbeUnavailable), ageservice.Result(ageipc.ClassRecoveryUnavailable):
+		return FailureBackendUnavailable
+	case ageservice.Result(ageipc.ClassTargetMismatch):
+		return FailureKeyMismatch
+	case ageservice.Result(ageipc.ClassPINFailed):
+		return FailureProviderInitialization
+	default:
+		return FailureInternal
 	}
 }
