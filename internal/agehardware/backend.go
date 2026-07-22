@@ -18,8 +18,16 @@ var (
 	ErrTargetMismatch   = errors.New("YubiKey target mismatch")
 	ErrProbeUnavailable = errors.New("YubiKey probe unavailable")
 	ErrPINLoginFailed   = errors.New("YubiKey PIN login failed")
+	ErrPolicyMismatch   = errors.New("YubiKey key policy mismatch")
 	ErrReadyFailed      = errors.New("YubiKey operation was not authorized to continue")
 	ErrDeriveFailed     = errors.New("YubiKey key derivation failed")
+)
+
+const (
+	ckaYubicoTouchPolicy = pkcs11.CKA_VENDOR_DEFINED + 0x59554200 + 1
+	ckaYubicoPINPolicy   = pkcs11.CKA_VENDOR_DEFINED + 0x59554200 + 2
+	touchPolicyAlways    = byte(2)
+	pinPolicyOnce        = byte(2)
 )
 
 type ProbeState string
@@ -49,7 +57,8 @@ type module interface {
 	GetTokenInfo(uint) (pkcs11.TokenInfo, error)
 	OpenSession(uint, uint) (pkcs11.SessionHandle, error)
 	CloseSession(pkcs11.SessionHandle) error
-	Login(pkcs11.SessionHandle, uint, string) error
+	GetSessionInfo(pkcs11.SessionHandle) (pkcs11.SessionInfo, error)
+	LoginBytes(pkcs11.SessionHandle, uint, []byte) error
 	Logout(pkcs11.SessionHandle) error
 	FindObjectsInit(pkcs11.SessionHandle, []*pkcs11.Attribute) error
 	FindObjects(pkcs11.SessionHandle, int) ([]pkcs11.ObjectHandle, bool, error)
@@ -61,6 +70,26 @@ type module interface {
 
 type moduleFactory func(string) module
 
+type pkcs11Module struct {
+	*pkcs11.Ctx
+	provider string
+}
+
+func newPKCS11Module(provider string) module {
+	ctx := pkcs11.New(provider)
+	if ctx == nil {
+		return nil
+	}
+	return &pkcs11Module{Ctx: ctx, provider: provider}
+}
+
+func (m *pkcs11Module) LoginBytes(session pkcs11.SessionHandle, user uint, pin []byte) error {
+	if m == nil || m.Ctx == nil {
+		return pkcs11.Error(pkcs11.CKR_CRYPTOKI_NOT_INITIALIZED)
+	}
+	return secureLoginBytes(m.provider, session, user, pin)
+}
+
 type Backend struct {
 	provider string
 	factory  moduleFactory
@@ -71,12 +100,29 @@ type Backend struct {
 	newECDHParams func(uint, []byte, []byte) *pkcs11.ECDH1DeriveParams
 }
 
+// Session owns one initialized PKCS#11 module and one authenticated token
+// session. Its methods are serialized because PKCS#11 operation state belongs
+// to the session handle, not to an individual Go call.
+type Session struct {
+	mu sync.Mutex
+
+	backend       *Backend
+	module        module
+	tokenSlot     uint
+	handle        pkcs11.SessionHandle
+	slotID        byte
+	target        Target
+	privateObject pkcs11.ObjectHandle
+	loggedIn      bool
+	closed        bool
+
+	newECDHParams func(uint, []byte, []byte) *pkcs11.ECDH1DeriveParams
+}
+
 func New(provider string) *Backend {
 	return &Backend{
-		provider: provider,
-		factory: func(path string) module {
-			return pkcs11.New(path)
-		},
+		provider:      provider,
+		factory:       newPKCS11Module,
 		gate:          make(chan struct{}, 1),
 		closed:        make(chan struct{}),
 		newECDHParams: pkcs11.NewECDH1DeriveParams,
@@ -217,110 +263,24 @@ func (b *Backend) derive(
 	peer [32]byte,
 	ready func() error,
 ) (secret [32]byte, err error) {
-	slotID, validationErr := pivSlotID(target.Slot)
-	if validationErr != nil || !validSerial(target.Serial) {
-		return secret, ErrTargetMismatch
-	}
-	if acquireErr := b.acquire(ctx); acquireErr != nil {
-		return secret, classifyDeriveError(acquireErr)
-	}
-	defer b.release()
-
 	pinCopy := append([]byte(nil), pin...)
-	peerCopy := append([]byte(nil), peer[:]...)
 	defer zero(pinCopy)
-	defer zero(peerCopy)
 	defer zero(peer[:])
 
-	m, moduleErr := b.openModule(ctx)
-	if moduleErr != nil {
-		return secret, classifyDeriveError(moduleErr)
-	}
-	defer m.Destroy()
-	defer func() {
-		if finalizeErr := m.Finalize(); finalizeErr != nil {
-			zero(secret[:])
-			err = ErrDeriveFailed
-		}
-	}()
-
-	tokenSlot, locateErr := locateToken(ctx, m, target.Serial)
-	if locateErr != nil {
-		if isContextError(locateErr) {
-			return secret, locateErr
-		}
-		if errors.Is(locateErr, ErrNotDetected) || errors.Is(locateErr, ErrTargetMismatch) {
-			return secret, ErrTargetMismatch
-		}
-		return secret, ErrDeriveFailed
-	}
-
-	if contextErr := ctx.Err(); contextErr != nil {
-		return secret, contextErr
-	}
-	session, sessionErr := m.OpenSession(tokenSlot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
-	contextErr := ctx.Err()
+	session, sessionErr := b.OpenSession(ctx, target)
 	if sessionErr != nil {
-		if contextErr != nil {
-			return secret, contextErr
-		}
-		return secret, classifyDeriveError(sessionErr)
+		return secret, sessionErr
 	}
 	defer func() {
-		if closeErr := m.CloseSession(session); closeErr != nil {
+		if closeErr := session.Close(); closeErr != nil {
 			zero(secret[:])
 			err = ErrDeriveFailed
 		}
 	}()
-	if contextErr != nil {
-		return secret, contextErr
-	}
-
-	publicObject, unique, findErr := findUnique(ctx, m, session, keyTemplate(pkcs11.CKO_PUBLIC_KEY, slotID))
-	if findErr != nil {
-		return secret, classifyDeriveError(findErr)
-	}
-	if !unique {
-		return secret, ErrTargetMismatch
-	}
-	attributes, attrErr := callValue(ctx, func() ([]*pkcs11.Attribute, error) {
-		return m.GetAttributeValue(session, publicObject, []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_EC_POINT, nil)})
-	})
-	if attrErr != nil {
-		zeroAttributes(attributes)
-		return secret, classifyDeriveError(attrErr)
-	}
-	if !matchesPublicKey(attributes, target.PublicKey) {
-		zeroAttributes(attributes)
-		return secret, ErrTargetMismatch
-	}
-	zeroAttributes(attributes)
-
-	if contextErr := ctx.Err(); contextErr != nil {
-		return secret, contextErr
-	}
-	loginErr := login(m, session, pinCopy)
-	contextErr = ctx.Err()
-	if loginErr == nil {
-		defer func() {
-			if logoutErr := m.Logout(session); logoutErr != nil {
-				zero(secret[:])
-				err = ErrDeriveFailed
-			}
-		}()
-	}
-	if contextErr != nil {
-		return secret, contextErr
-	}
+	loginErr := session.Login(ctx, pinCopy)
+	zero(pinCopy)
 	if loginErr != nil {
-		return secret, ErrPINLoginFailed
-	}
-	privateObject, unique, findErr := findUnique(ctx, m, session, keyTemplate(pkcs11.CKO_PRIVATE_KEY, slotID))
-	if findErr != nil {
-		return secret, classifyDeriveError(findErr)
-	}
-	if !unique {
-		return secret, ErrTargetMismatch
+		return secret, loginErr
 	}
 	if ready != nil {
 		if readyErr := ready(); readyErr != nil {
@@ -333,20 +293,200 @@ func (b *Backend) derive(
 			return secret, contextErr
 		}
 	}
+	return session.Derive(ctx, peer)
+}
+
+// OpenSession initializes the provider, opens one read/write session, and
+// verifies the configured public object before returning ownership to the
+// caller. The backend gate remains held until Session.Close.
+func (b *Backend) OpenSession(ctx context.Context, target Target) (result *Session, err error) {
+	slotID, validationErr := pivSlotID(target.Slot)
+	if validationErr != nil || !validSerial(target.Serial) {
+		return nil, ErrTargetMismatch
+	}
+	if acquireErr := b.acquire(ctx); acquireErr != nil {
+		return nil, classifyDeriveError(acquireErr)
+	}
+
+	var m module
+	var handle pkcs11.SessionHandle
+	opened := false
+	defer func() {
+		if result != nil {
+			return
+		}
+		cleanupFailed := false
+		if opened && m.CloseSession(handle) != nil {
+			cleanupFailed = true
+		}
+		if m != nil {
+			if m.Finalize() != nil {
+				cleanupFailed = true
+			}
+			m.Destroy()
+		}
+		b.release()
+		if cleanupFailed && !isContextError(err) {
+			err = ErrDeriveFailed
+		}
+	}()
+
+	m, err = b.openModule(ctx)
+	if err != nil {
+		return nil, classifyDeriveError(err)
+	}
+	tokenSlot, locateErr := locateToken(ctx, m, target.Serial)
+	if locateErr != nil {
+		if isContextError(locateErr) {
+			return nil, locateErr
+		}
+		if errors.Is(locateErr, ErrNotDetected) || errors.Is(locateErr, ErrTargetMismatch) {
+			return nil, ErrTargetMismatch
+		}
+		return nil, ErrDeriveFailed
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
+	}
+	handle, err = m.OpenSession(tokenSlot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
+	contextErr := ctx.Err()
+	if err != nil {
+		if contextErr != nil {
+			return nil, contextErr
+		}
+		return nil, classifyDeriveError(err)
+	}
+	opened = true
+	if contextErr != nil {
+		return nil, contextErr
+	}
+	if err := validatePublicTarget(ctx, m, handle, slotID, target.PublicKey); err != nil {
+		return nil, err
+	}
+	result = &Session{
+		backend:       b,
+		module:        m,
+		tokenSlot:     tokenSlot,
+		handle:        handle,
+		slotID:        slotID,
+		target:        target,
+		newECDHParams: b.newECDHParams,
+	}
+	return result, nil
+}
+
+// Login consumes and clears pin on every return path, authenticates this
+// session exactly once, and pins it to one private object whose Yubico
+// policies are PIN=ONCE and touch=ALWAYS.
+func (s *Session) Login(ctx context.Context, pin []byte) error {
+	defer zero(pin)
+	if s == nil {
+		return ErrPINLoginFailed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.module == nil || s.loggedIn || len(pin) == 0 || backendClosed(s.backend) {
+		return ErrPINLoginFailed
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	loginErr := s.module.LoginBytes(s.handle, pkcs11.CKU_USER, pin)
+	contextErr := ctx.Err()
+	if loginErr == nil {
+		s.loggedIn = true
+	}
+	if contextErr != nil {
+		return contextErr
+	}
+	if loginErr != nil {
+		return ErrPINLoginFailed
+	}
+	privateObject, unique, findErr := findUnique(ctx, s.module, s.handle, keyTemplate(pkcs11.CKO_PRIVATE_KEY, s.slotID))
+	if findErr != nil {
+		return classifyDeriveError(findErr)
+	}
+	if !unique {
+		return ErrTargetMismatch
+	}
+	if err := validatePrivatePolicy(ctx, s.module, s.handle, privateObject); err != nil {
+		return err
+	}
+	s.privateObject = privateObject
+	return nil
+}
+
+// Validate confirms that the retained handle is still an authenticated
+// read/write session for the same token and the same public/private objects.
+func (s *Session) Validate(ctx context.Context) error {
+	if s == nil {
+		return ErrDeriveFailed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.module == nil || !s.loggedIn || s.privateObject == 0 || backendClosed(s.backend) {
+		return ErrDeriveFailed
+	}
+	info, infoErr := callValue(ctx, func() (pkcs11.SessionInfo, error) {
+		return s.module.GetSessionInfo(s.handle)
+	})
+	if infoErr != nil {
+		return classifyDeriveError(infoErr)
+	}
+	requiredFlags := uint(pkcs11.CKF_SERIAL_SESSION | pkcs11.CKF_RW_SESSION)
+	if info.SlotID != s.tokenSlot || info.State != pkcs11.CKS_RW_USER_FUNCTIONS || info.Flags&requiredFlags != requiredFlags {
+		return ErrDeriveFailed
+	}
+	tokenInfo, tokenErr := callValue(ctx, func() (pkcs11.TokenInfo, error) {
+		return s.module.GetTokenInfo(s.tokenSlot)
+	})
+	if tokenErr != nil {
+		return classifyDeriveError(tokenErr)
+	}
+	if tokenInfo.SerialNumber != s.target.Serial {
+		return ErrTargetMismatch
+	}
+	if err := validatePublicTarget(ctx, s.module, s.handle, s.slotID, s.target.PublicKey); err != nil {
+		return err
+	}
+	privateObject, unique, findErr := findUnique(ctx, s.module, s.handle, keyTemplate(pkcs11.CKO_PRIVATE_KEY, s.slotID))
+	if findErr != nil {
+		return classifyDeriveError(findErr)
+	}
+	if !unique || privateObject != s.privateObject {
+		return ErrTargetMismatch
+	}
+	return validatePrivatePolicy(ctx, s.module, s.handle, privateObject)
+}
+
+// Derive performs one ECDH operation without changing login state. The
+// derived object is destroyed before the method returns on every path.
+func (s *Session) Derive(ctx context.Context, peer [32]byte) (secret [32]byte, err error) {
+	if s == nil {
+		return secret, ErrDeriveFailed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.module == nil || !s.loggedIn || s.privateObject == 0 || s.newECDHParams == nil || backendClosed(s.backend) {
+		return secret, ErrDeriveFailed
+	}
+	peerCopy := append([]byte(nil), peer[:]...)
+	defer zero(peerCopy)
+	defer zero(peer[:])
 
 	template := derivedSecretTemplate()
 	defer zeroAttributes(template)
-	params := b.newECDHParams(pkcs11.CKD_NULL, nil, peerCopy)
+	params := s.newECDHParams(pkcs11.CKD_NULL, nil, peerCopy)
 	mechanisms := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_ECDH1_DERIVE, params)}
 	if contextErr := ctx.Err(); contextErr != nil {
 		return secret, contextErr
 	}
-	derivedObject, deriveErr := m.DeriveKey(session, mechanisms, privateObject, template)
-	contextErr = ctx.Err()
+	derivedObject, deriveErr := s.module.DeriveKey(s.handle, mechanisms, s.privateObject, template)
+	contextErr := ctx.Err()
 	derived := deriveErr == nil || derivedObject != 0
 	if derived {
 		defer func() {
-			if destroyErr := m.DestroyObject(session, derivedObject); destroyErr != nil {
+			if destroyErr := s.module.DestroyObject(s.handle, derivedObject); destroyErr != nil {
 				zero(secret[:])
 				err = ErrDeriveFailed
 			}
@@ -360,7 +500,7 @@ func (b *Backend) derive(
 	}
 
 	valueAttributes, valueErr := callValue(ctx, func() ([]*pkcs11.Attribute, error) {
-		return m.GetAttributeValue(session, derivedObject, []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil)})
+		return s.module.GetAttributeValue(s.handle, derivedObject, []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil)})
 	})
 	if valueErr != nil {
 		zeroAttributes(valueAttributes)
@@ -377,6 +517,98 @@ func (b *Backend) derive(
 		return secret, ErrDeriveFailed
 	}
 	return secret, nil
+}
+
+// Close tears down all PKCS#11 state and releases the backend gate. It is
+// idempotent and never returns provider-specific error text.
+func (s *Session) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	cleanupFailed := false
+	if s.loggedIn && s.module.Logout(s.handle) != nil {
+		cleanupFailed = true
+	}
+	s.loggedIn = false
+	s.privateObject = 0
+	if s.module != nil {
+		if s.module.CloseSession(s.handle) != nil {
+			cleanupFailed = true
+		}
+		if s.module.Finalize() != nil {
+			cleanupFailed = true
+		}
+		s.module.Destroy()
+		s.module = nil
+	}
+	if s.backend != nil {
+		s.backend.release()
+		s.backend = nil
+	}
+	if cleanupFailed {
+		return ErrDeriveFailed
+	}
+	return nil
+}
+
+func validatePublicTarget(ctx context.Context, m module, session pkcs11.SessionHandle, slotID byte, expected [32]byte) error {
+	publicObject, unique, findErr := findUnique(ctx, m, session, keyTemplate(pkcs11.CKO_PUBLIC_KEY, slotID))
+	if findErr != nil {
+		return classifyDeriveError(findErr)
+	}
+	if !unique {
+		return ErrTargetMismatch
+	}
+	attributes, attrErr := callValue(ctx, func() ([]*pkcs11.Attribute, error) {
+		return m.GetAttributeValue(session, publicObject, []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_EC_POINT, nil)})
+	})
+	if attrErr != nil {
+		zeroAttributes(attributes)
+		return classifyDeriveError(attrErr)
+	}
+	defer zeroAttributes(attributes)
+	if !matchesPublicKey(attributes, expected) {
+		return ErrTargetMismatch
+	}
+	return nil
+}
+
+func validatePrivatePolicy(ctx context.Context, m module, session pkcs11.SessionHandle, privateObject pkcs11.ObjectHandle) error {
+	attributes, attrErr := callValue(ctx, func() ([]*pkcs11.Attribute, error) {
+		return m.GetAttributeValue(session, privateObject, []*pkcs11.Attribute{
+			pkcs11.NewAttribute(ckaYubicoTouchPolicy, nil),
+			pkcs11.NewAttribute(ckaYubicoPINPolicy, nil),
+		})
+	})
+	if attrErr != nil {
+		zeroAttributes(attributes)
+		return classifyDeriveError(attrErr)
+	}
+	defer zeroAttributes(attributes)
+	if len(attributes) != 2 || attributes[0] == nil || attributes[1] == nil ||
+		attributes[0].Type != ckaYubicoTouchPolicy || len(attributes[0].Value) != 1 || attributes[0].Value[0] != touchPolicyAlways ||
+		attributes[1].Type != ckaYubicoPINPolicy || len(attributes[1].Value) != 1 || attributes[1].Value[0] != pinPolicyOnce {
+		return ErrPolicyMismatch
+	}
+	return nil
+}
+
+func backendClosed(backend *Backend) bool {
+	if backend == nil || backend.closed == nil {
+		return true
+	}
+	select {
+	case <-backend.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Backend) openModule(ctx context.Context) (module, error) {
@@ -577,12 +809,6 @@ func validSerial(serial string) bool {
 	return err == nil && value != 0 && strconv.FormatUint(value, 10) == serial
 }
 
-func login(m module, session pkcs11.SessionHandle, pin []byte) error {
-	// miekg/pkcs11 requires an immutable string. Keep that unavoidable copy in
-	// this small scope; the caller still clears all mutable PIN buffers.
-	return m.Login(session, pkcs11.CKU_USER, string(pin))
-}
-
 func callErr(ctx context.Context, call func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -614,7 +840,7 @@ func classifyProbeError(err error) error {
 }
 
 func classifyDeriveError(err error) error {
-	if isContextError(err) || errors.Is(err, ErrTargetMismatch) || errors.Is(err, ErrPINLoginFailed) || errors.Is(err, ErrDeriveFailed) {
+	if isContextError(err) || errors.Is(err, ErrTargetMismatch) || errors.Is(err, ErrPINLoginFailed) || errors.Is(err, ErrPolicyMismatch) || errors.Is(err, ErrDeriveFailed) {
 		return err
 	}
 	return ErrDeriveFailed

@@ -355,6 +355,180 @@ func TestDeriveClassifiesFailuresAndDestroysTemporaryObject(t *testing.T) {
 	}
 }
 
+func TestSessionReusesOneLoginForTwoDerives(t *testing.T) {
+	publicKey := bytes32(1)
+	shared := bytes32(129)
+	module := deriveFake(publicKey, shared)
+	module.findResults = append(module.findResults,
+		[]pkcs11.ObjectHandle{testPublicObject}, nil,
+		[]pkcs11.ObjectHandle{testPrivateObject}, nil,
+		[]pkcs11.ObjectHandle{testPublicObject}, nil,
+		[]pkcs11.ObjectHandle{testPrivateObject}, nil,
+	)
+	backend := fakeBackend(module)
+	session, err := backend.OpenSession(context.Background(), Target{Serial: testSerial, Slot: "82", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := []byte("654321")
+	if err := session.Login(context.Background(), pin); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pin, make([]byte, len(pin))) {
+		t.Fatalf("successful Login did not clear PIN: %x", pin)
+	}
+
+	for i, peerStart := range []byte{65, 97} {
+		if err := session.Validate(context.Background()); err != nil {
+			t.Fatalf("Validate %d: %v", i+1, err)
+		}
+		got, err := session.Derive(context.Background(), bytes32(peerStart))
+		if err != nil || got != shared {
+			t.Fatalf("Derive %d = %x, %v", i+1, got, err)
+		}
+	}
+	if module.initializeCalls != 1 || len(module.openFlags) != 1 || module.loginCalls != 1 || module.deriveCalls != 2 {
+		t.Fatalf("calls initialize=%d open=%d login=%d derive=%d", module.initializeCalls, len(module.openFlags), module.loginCalls, module.deriveCalls)
+	}
+	if module.logoutCalls != 0 || module.closeCalls != 0 || module.finalizeCalls != 0 || module.destroyCalls != 0 {
+		t.Fatal("successful derives tore down the authenticated session")
+	}
+	if len(module.destroyed) != 2 || module.destroyed[0] != testDerivedObject || module.destroyed[1] != testDerivedObject {
+		t.Fatalf("destroyed objects = %v", module.destroyed)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if module.logoutCalls != 1 || module.closeCalls != 1 || module.finalizeCalls != 1 || module.destroyCalls != 1 {
+		t.Fatalf("cleanup calls logout=%d close=%d finalize=%d destroy=%d", module.logoutCalls, module.closeCalls, module.finalizeCalls, module.destroyCalls)
+	}
+}
+
+func TestSessionLoginClearsPINAfterFailure(t *testing.T) {
+	publicKey := bytes32(1)
+	module := deriveFake(publicKey, bytes32(129))
+	module.loginError = errors.New("rejected PIN private detail")
+	backend := fakeBackend(module)
+	session, err := backend.OpenSession(context.Background(), Target{Serial: testSerial, Slot: "82", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := []byte("654321")
+	if err := session.Login(context.Background(), pin); !errors.Is(err, ErrPINLoginFailed) {
+		t.Fatalf("Login error = %v", err)
+	}
+	if !bytes.Equal(pin, make([]byte, len(pin))) {
+		t.Fatalf("failed Login did not clear PIN: %x", pin)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionRejectsNonConformingKeyPolicies(t *testing.T) {
+	publicKey := bytes32(1)
+	tests := []struct {
+		name       string
+		attributes []*pkcs11.Attribute
+	}{
+		{name: "touch never", attributes: policyAttributes(1, pinPolicyOnce)},
+		{name: "touch cached", attributes: policyAttributes(3, pinPolicyOnce)},
+		{name: "PIN always", attributes: policyAttributes(touchPolicyAlways, 3)},
+		{name: "PIN never", attributes: policyAttributes(touchPolicyAlways, 1)},
+		{name: "missing", attributes: policyAttributes(touchPolicyAlways, pinPolicyOnce)[:1]},
+		{name: "short", attributes: []*pkcs11.Attribute{
+			pkcs11.NewAttribute(ckaYubicoTouchPolicy, nil),
+			pkcs11.NewAttribute(ckaYubicoPINPolicy, []byte{pinPolicyOnce}),
+		}},
+		{name: "wrong type", attributes: []*pkcs11.Attribute{
+			pkcs11.NewAttribute(ckaYubicoPINPolicy, []byte{touchPolicyAlways}),
+			pkcs11.NewAttribute(ckaYubicoTouchPolicy, []byte{pinPolicyOnce}),
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			module := deriveFake(publicKey, bytes32(129))
+			module.attributes[testPrivateObject] = test.attributes
+			got, err := fakeBackend(module).Derive(
+				context.Background(),
+				Target{Serial: testSerial, Slot: "82", PublicKey: publicKey},
+				[]byte("654321"),
+				bytes32(65),
+			)
+			if !errors.Is(err, ErrPolicyMismatch) || got != ([32]byte{}) {
+				t.Fatalf("Derive = %x, %v", got, err)
+			}
+			if module.deriveCalls != 0 {
+				t.Fatal("policy mismatch reached ECDH")
+			}
+			if module.logoutCalls != 1 || module.closeCalls != 1 || module.finalizeCalls != 1 || module.destroyCalls != 1 {
+				t.Fatalf("cleanup calls logout=%d close=%d finalize=%d destroy=%d", module.logoutCalls, module.closeCalls, module.finalizeCalls, module.destroyCalls)
+			}
+		})
+	}
+}
+
+func TestSessionValidateFailsClosedForInvalidSession(t *testing.T) {
+	publicKey := bytes32(1)
+	fake := deriveFake(publicKey, bytes32(129))
+	backend := fakeBackend(fake)
+	session, err := backend.OpenSession(context.Background(), Target{Serial: testSerial, Slot: "82", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Login(context.Background(), []byte("654321")); err != nil {
+		t.Fatal(err)
+	}
+	fake.sessionInfoError = errors.New("removed token private detail")
+	if err := session.Validate(context.Background()); !errors.Is(err, ErrDeriveFailed) {
+		t.Fatalf("Validate error = %v", err)
+	}
+	if fake.deriveCalls != 0 {
+		t.Fatal("invalid session reached ECDH")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionCloseAttemptsAllCleanupAfterErrors(t *testing.T) {
+	publicKey := bytes32(1)
+	fake := deriveFake(publicKey, bytes32(129))
+	backend := fakeBackend(fake)
+	session, err := backend.OpenSession(context.Background(), Target{Serial: testSerial, Slot: "82", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Login(context.Background(), []byte("654321")); err != nil {
+		t.Fatal(err)
+	}
+	fake.logoutError = errors.New("logout private detail")
+	fake.closeError = errors.New("close private detail")
+	fake.finalizeError = errors.New("finalize private detail")
+	if err := session.Close(); !errors.Is(err, ErrDeriveFailed) {
+		t.Fatalf("Close error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second Close error = %v", err)
+	}
+	if fake.logoutCalls != 1 || fake.closeCalls != 1 || fake.finalizeCalls != 1 || fake.destroyCalls != 1 {
+		t.Fatalf("cleanup calls logout=%d close=%d finalize=%d destroy=%d", fake.logoutCalls, fake.closeCalls, fake.finalizeCalls, fake.destroyCalls)
+	}
+
+	replacement := deriveFake(publicKey, bytes32(129))
+	backend.factory = func(string) module { return replacement }
+	replacementSession, err := backend.OpenSession(context.Background(), Target{Serial: testSerial, Slot: "82", PublicKey: publicKey})
+	if err != nil {
+		t.Fatalf("cleanup did not release backend gate: %v", err)
+	}
+	if err := replacementSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestQueuedCanceledContextDoesNotEnterPKCS11(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -462,9 +636,11 @@ func deriveFake(publicKey [32]byte, shared [32]byte) *fakeModule {
 	return &fakeModule{
 		slots:       []uint{7},
 		tokenInfos:  map[uint]pkcs11.TokenInfo{7: {SerialNumber: testSerial}},
+		sessionInfo: pkcs11.SessionInfo{SlotID: 7, State: pkcs11.CKS_RW_USER_FUNCTIONS, Flags: pkcs11.CKF_SERIAL_SESSION | pkcs11.CKF_RW_SESSION},
 		findResults: [][]pkcs11.ObjectHandle{{testPublicObject}, nil, {testPrivateObject}, nil},
 		attributes: map[pkcs11.ObjectHandle][]*pkcs11.Attribute{
 			testPublicObject:  {ecPointAttribute(publicKey)},
+			testPrivateObject: policyAttributes(touchPolicyAlways, pinPolicyOnce),
 			testDerivedObject: {pkcs11.NewAttribute(pkcs11.CKA_VALUE, shared[:])},
 		},
 		deriveObject: testDerivedObject,
@@ -476,6 +652,13 @@ func ecPointAttribute(publicKey [32]byte) *pkcs11.Attribute {
 	value[0], value[1] = 0x04, 0x20
 	copy(value[2:], publicKey[:])
 	return pkcs11.NewAttribute(pkcs11.CKA_EC_POINT, value)
+}
+
+func policyAttributes(touch, pin byte) []*pkcs11.Attribute {
+	return []*pkcs11.Attribute{
+		pkcs11.NewAttribute(ckaYubicoTouchPolicy, []byte{touch}),
+		pkcs11.NewAttribute(ckaYubicoPINPolicy, []byte{pin}),
+	}
 }
 
 func bytes32(start byte) [32]byte {
@@ -514,18 +697,19 @@ func assertTemplate(t *testing.T, got []*pkcs11.Attribute, want []*pkcs11.Attrib
 type fakeModule struct {
 	mu sync.Mutex
 
-	initializeError error
-	finalizeError   error
-	openError       error
-	closeError      error
-	loginError      error
-	logoutError     error
-	findInitError   error
-	findError       error
-	findFinalError  error
-	deriveError     error
-	destroyError    error
-	deriveHook      func()
+	initializeError  error
+	finalizeError    error
+	openError        error
+	closeError       error
+	sessionInfoError error
+	loginError       error
+	logoutError      error
+	findInitError    error
+	findError        error
+	findFinalError   error
+	deriveError      error
+	destroyError     error
+	deriveHook       func()
 
 	slots           []uint
 	tokenInfos      map[uint]pkcs11.TokenInfo
@@ -534,26 +718,29 @@ type fakeModule struct {
 	attributes      map[pkcs11.ObjectHandle][]*pkcs11.Attribute
 	attributeErrors map[pkcs11.ObjectHandle]error
 	deriveObject    pkcs11.ObjectHandle
+	sessionInfo     pkcs11.SessionInfo
 
 	getSlotListStarted chan struct{}
 	getSlotListRelease chan struct{}
 	startOnce          sync.Once
 
-	initializeCalls int
-	finalizeCalls   int
-	destroyCalls    int
-	slotListCalls   int
-	closeCalls      int
-	loginCalls      int
-	logoutCalls     int
-	loginUser       uint
-	loginPIN        string
-	openFlags       []uint
-	findTemplates   [][]*pkcs11.Attribute
-	mechanisms      []*pkcs11.Mechanism
-	deriveBase      pkcs11.ObjectHandle
-	deriveTemplate  []*pkcs11.Attribute
-	destroyed       []pkcs11.ObjectHandle
+	initializeCalls  int
+	finalizeCalls    int
+	destroyCalls     int
+	slotListCalls    int
+	closeCalls       int
+	loginCalls       int
+	sessionInfoCalls int
+	logoutCalls      int
+	deriveCalls      int
+	loginUser        uint
+	loginPIN         string
+	openFlags        []uint
+	findTemplates    [][]*pkcs11.Attribute
+	mechanisms       []*pkcs11.Mechanism
+	deriveBase       pkcs11.ObjectHandle
+	deriveTemplate   []*pkcs11.Attribute
+	destroyed        []pkcs11.ObjectHandle
 }
 
 func (m *fakeModule) Initialize(...pkcs11.InitializeOption) error {
@@ -609,10 +796,15 @@ func (m *fakeModule) CloseSession(pkcs11.SessionHandle) error {
 	return m.closeError
 }
 
-func (m *fakeModule) Login(_ pkcs11.SessionHandle, user uint, pin string) error {
+func (m *fakeModule) GetSessionInfo(pkcs11.SessionHandle) (pkcs11.SessionInfo, error) {
+	m.sessionInfoCalls++
+	return m.sessionInfo, m.sessionInfoError
+}
+
+func (m *fakeModule) LoginBytes(_ pkcs11.SessionHandle, user uint, pin []byte) error {
 	m.loginCalls++
 	m.loginUser = user
-	m.loginPIN = pin
+	m.loginPIN = string(pin)
 	return m.loginError
 }
 
@@ -653,6 +845,7 @@ func (m *fakeModule) GetAttributeValue(_ pkcs11.SessionHandle, object pkcs11.Obj
 }
 
 func (m *fakeModule) DeriveKey(_ pkcs11.SessionHandle, mechanisms []*pkcs11.Mechanism, base pkcs11.ObjectHandle, template []*pkcs11.Attribute) (pkcs11.ObjectHandle, error) {
+	m.deriveCalls++
 	m.mechanisms = append([]*pkcs11.Mechanism(nil), mechanisms...)
 	m.deriveBase = base
 	m.deriveTemplate = cloneAttributes(template)
