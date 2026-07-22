@@ -375,7 +375,7 @@ func TestSignAllowsMissingDeviceOnDirectFallbackRoute(t *testing.T) {
 			return agentroute.FallbackReport{Reachable: true, TargetKeyFound: true}, nil
 		},
 		DebounceCount: 1,
-		PollInterval:  5 * time.Millisecond,
+		PollInterval:  time.Hour,
 		GuardPath:     agentroute.GuardPath(config.DefaultPath(home)),
 	})
 	if err := router.Initialize(); err != nil {

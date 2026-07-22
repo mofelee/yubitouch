@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitKeys.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBHostFamilyDefinitions.h>
 #import <IOKit/usb/USBSpec.h>
@@ -31,14 +32,27 @@ static CFMutableDictionaryRef YTYubiKeyMatchingDictionary(void) {
     if (matching == NULL) {
         return NULL;
     }
-    int vendorID = YTYubicoVendorID;
-    CFNumberRef vendor = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorID);
-    if (vendor == NULL) {
+    CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    if (properties == NULL) {
         CFRelease(matching);
         return NULL;
     }
-    CFDictionarySetValue(matching, CFSTR(kUSBVendorID), vendor);
+    int vendorID = YTYubicoVendorID;
+    CFNumberRef vendor = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorID);
+    if (vendor == NULL) {
+        CFRelease(properties);
+        CFRelease(matching);
+        return NULL;
+    }
+    CFDictionarySetValue(properties, CFSTR(kUSBVendorID), vendor);
     CFRelease(vendor);
+    CFDictionarySetValue(matching, CFSTR(kIOPropertyMatchKey), properties);
+    CFRelease(properties);
     return matching;
 }
 

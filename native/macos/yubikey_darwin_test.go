@@ -2,7 +2,34 @@
 
 package macos
 
-import "testing"
+import (
+	"bytes"
+	"os/exec"
+	"testing"
+)
+
+func TestConnectedYubicoDeviceIsCounted(t *testing.T) {
+	output, err := exec.Command(
+		"/usr/sbin/ioreg",
+		"-r",
+		"-c", "IOUSBHostDevice",
+		"-d", "0",
+		"-l",
+	).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte(`"idVendor" = 4176`)) {
+		t.Skip("no Yubico USB device is connected")
+	}
+	count, err := CountYubiKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count == 0 {
+		t.Fatal("IOKit did not count the connected Yubico USB device")
+	}
+}
 
 func TestYubiKeyRegistryCountAndMonitorLifecycle(t *testing.T) {
 	count, err := CountYubiKeys()
