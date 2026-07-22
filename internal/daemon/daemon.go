@@ -71,7 +71,8 @@ func Run(ctx context.Context, options Options) error {
 	}
 	deviceProbe := system.ProbeYubiKeys
 	var deviceMonitor *system.YubiKeyMonitor
-	if cfg.FallbackAgent == config.FallbackAgent1Password {
+	var deviceEvents deviceEventStreams
+	if needsYubiKeyMonitor(cfg) {
 		deviceMonitor, err = system.NewYubiKeyMonitor()
 		if err != nil {
 			_ = logger.Write(diagnostic.LevelError, diagnostic.EventDaemonFailed, diagnostic.Classify(err))
@@ -79,6 +80,7 @@ func Run(ctx context.Context, options Options) error {
 		}
 		defer deviceMonitor.Close()
 		deviceProbe = deviceMonitor.Probe
+		deviceEvents = fanOutDeviceEvents(deviceMonitor.Events())
 	}
 	manager := backend.New(cfg, deps, options.Executable, options.ConfigPath)
 	manager.SetDeviceProbe(deviceProbe)
@@ -111,13 +113,9 @@ func Run(ctx context.Context, options Options) error {
 		}
 		_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventAgeIPCListening, diagnostic.FailureNone)
 	}
-	var probeEvents <-chan struct{}
-	if deviceMonitor != nil {
-		probeEvents = deviceMonitor.Events()
-	}
 	router := agentroute.New(cfg, agentroute.Options{
 		Probe:       deviceProbe,
-		ProbeEvents: probeEvents,
+		ProbeEvents: deviceEvents.Router,
 		GuardPath:   guardPath,
 		OnError: func(err error) {
 			_ = logger.Write(diagnostic.LevelError, diagnostic.EventRouteFailClosed, diagnostic.Classify(err))

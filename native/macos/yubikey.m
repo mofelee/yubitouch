@@ -88,28 +88,37 @@ static void YTSignalMonitor(struct YTYubiKeyMonitor *monitor) {
     } while (result < 0 && errno == EINTR);
 }
 
-static void YTRefreshMonitor(struct YTYubiKeyMonitor *monitor) {
+static void YTRefreshMonitor(struct YTYubiKeyMonitor *monitor, bool deviceEvent) {
     int count = 0;
     int status = YTCountYubiKeys(&count);
-    bool changed = false;
+    bool shouldSignal = false;
     pthread_mutex_lock(&monitor->lock);
-    if (!monitor->closed && (monitor->status != status || (status == KERN_SUCCESS && monitor->count != count))) {
-        monitor->status = status;
-        monitor->count = count;
-        changed = true;
+    if (!monitor->closed) {
+        bool changed = monitor->status != status ||
+            (status == KERN_SUCCESS && monitor->count != count);
+        if (changed) {
+            monitor->status = status;
+            monitor->count = count;
+        }
+        // Device replacement can deliver one removal and one addition while
+        // the observable count remains unchanged. Every matching callback is
+        // therefore a session-invalidating event, independent of the snapshot.
+        shouldSignal = deviceEvent || changed;
     }
     pthread_mutex_unlock(&monitor->lock);
-    if (changed) {
+    if (shouldSignal) {
         YTSignalMonitor(monitor);
     }
 }
 
 static void YTDrainDeviceNotifications(void *context, io_iterator_t iterator) {
+    bool deviceEvent = false;
     io_service_t service;
     while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        deviceEvent = true;
         IOObjectRelease(service);
     }
-    YTRefreshMonitor((struct YTYubiKeyMonitor *)context);
+    YTRefreshMonitor((struct YTYubiKeyMonitor *)context, deviceEvent);
 }
 
 static void YTDestroyMonitorResources(struct YTYubiKeyMonitor *monitor) {
