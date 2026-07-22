@@ -5,11 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/mofelee/yubitouch/internal/config"
+	"github.com/mofelee/yubitouch/native/macos"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -29,51 +29,55 @@ type HardwareReport struct {
 }
 
 func ProbeYubiKeys(ctx context.Context) (int, error) {
-	return probeYubiKeys(ctx, lookupYKMan, commandOutput)
+	return probeYubiKeys(ctx, macos.CountYubiKeys)
 }
 
-func lookupYKMan(name string) (string, error) {
-	if path, err := exec.LookPath(name); err == nil {
-		return path, nil
+func probeYubiKeys(ctx context.Context, countDevices func() (int, error)) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	for _, path := range []string{"/opt/homebrew/bin/ykman", "/usr/local/bin/ykman"} {
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path, nil
-		}
-	}
-	return "", ErrYKManUnavailable
-}
-
-type pathLookup func(string) (string, error)
-
-type outputRunner func(context.Context, string, ...string) ([]byte, []byte, error)
-
-func probeYubiKeys(ctx context.Context, lookup pathLookup, run outputRunner) (int, error) {
-	ykman, err := lookup("ykman")
+	count, err := countDevices()
 	if err != nil {
-		return 0, ErrYKManUnavailable
-	}
-	serialOutput, diagnosticOutput, err := run(ctx, ykman, "list", "--serials")
-	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
 		return 0, fmt.Errorf("%w: %v", ErrDeviceProbe, err)
 	}
-	count := countNonEmptyLines(serialOutput)
-	if count == 0 && len(bytes.TrimSpace(diagnosticOutput)) != 0 {
-		return 0, ErrDeviceProbe
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	return count, nil
 }
 
-func commandOutput(ctx context.Context, path string, args ...string) ([]byte, []byte, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.Bytes(), stderr.Bytes(), err
+type YubiKeyMonitor struct {
+	native *macos.YubiKeyMonitor
+}
+
+func NewYubiKeyMonitor() (*YubiKeyMonitor, error) {
+	monitor, err := macos.NewYubiKeyMonitor()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDeviceProbe, err)
+	}
+	return &YubiKeyMonitor{native: monitor}, nil
+}
+
+func (m *YubiKeyMonitor) Probe(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	count, err := m.native.Count()
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrDeviceProbe, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (m *YubiKeyMonitor) Events() <-chan struct{} {
+	return m.native.Events()
+}
+
+func (m *YubiKeyMonitor) Close() error {
+	return m.native.Close()
 }
 
 func InspectHardware(ctx context.Context, cfg config.Config, deps Dependencies) (HardwareReport, error) {
@@ -141,14 +145,4 @@ func parseMetadata(output []byte) map[string]string {
 		}
 	}
 	return fields
-}
-
-func countNonEmptyLines(output []byte) int {
-	count := 0
-	for _, line := range bytes.Split(output, []byte{'\n'}) {
-		if len(bytes.TrimSpace(line)) != 0 {
-			count++
-		}
-	}
-	return count
 }

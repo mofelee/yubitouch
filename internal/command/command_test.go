@@ -369,7 +369,8 @@ func TestSignAllowsMissingDeviceOnDirectFallbackRoute(t *testing.T) {
 	fallbackListener := serveCommandAgent(t, cfg.FallbackAgentSocket, private)
 	defer fallbackListener.Close()
 	router := agentroute.New(cfg, agentroute.Options{
-		Probe: func(context.Context) (int, error) { return 0, nil },
+		Probe:       func(context.Context) (int, error) { return 0, nil },
+		ProbeEvents: make(chan struct{}),
 		InspectFallback: func(context.Context, config.Config) (agentroute.FallbackReport, error) {
 			return agentroute.FallbackReport{Reachable: true, TargetKeyFound: true}, nil
 		},

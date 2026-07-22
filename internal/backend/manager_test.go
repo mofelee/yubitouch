@@ -97,7 +97,7 @@ func TestAgentArgumentsOmitEmptyProviderAllowlist(t *testing.T) {
 
 func TestNormalizeSignFailureDetectsRemovedYubiKey(t *testing.T) {
 	manager := New(config.Config{}, system.Dependencies{}, "/bin/false", "/tmp/yubitouch-config.json")
-	manager.probeKeys = func(context.Context) (int, error) { return 0, nil }
+	manager.SetDeviceProbe(func(context.Context) (int, error) { return 0, nil })
 	raw := errors.New("agent refused operation")
 	err := manager.NormalizeSignFailure(context.Background(), raw)
 	if !errors.Is(err, signing.ErrDeviceUnavailable) {
@@ -108,13 +108,13 @@ func TestNormalizeSignFailureDetectsRemovedYubiKey(t *testing.T) {
 func TestNormalizeSignFailureRetriesTransientDeviceState(t *testing.T) {
 	manager := New(config.Config{}, system.Dependencies{}, "/bin/false", "/tmp/yubitouch-config.json")
 	probes := 0
-	manager.probeKeys = func(context.Context) (int, error) {
+	manager.SetDeviceProbe(func(context.Context) (int, error) {
 		probes++
 		if probes == 1 {
 			return 1, nil
 		}
 		return 0, nil
-	}
+	})
 	err := manager.NormalizeSignFailure(context.Background(), errors.New("agent refused operation"))
 	if !errors.Is(err, signing.ErrDeviceUnavailable) || probes != 2 {
 		t.Fatalf("normalized error = %v, probes = %d", err, probes)
@@ -128,7 +128,7 @@ func TestNormalizeSignFailurePreservesOtherFailures(t *testing.T) {
 		func(context.Context) (int, error) { return 1, nil },
 		func(context.Context) (int, error) { return 0, system.ErrDeviceProbe },
 	} {
-		manager.probeKeys = probe
+		manager.SetDeviceProbe(probe)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 		got := manager.NormalizeSignFailure(ctx, raw)
 		cancel()

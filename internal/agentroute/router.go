@@ -25,6 +25,11 @@ const (
 	defaultDebounceCount       = 2
 )
 
+var (
+	ErrProbeEventsRequired = errors.New("enabled fallback requires YubiKey events")
+	ErrProbeEventsClosed   = errors.New("YubiKey event stream closed")
+)
+
 type ProbeState string
 
 const (
@@ -47,6 +52,7 @@ type Snapshot struct {
 
 type Options struct {
 	Probe           func(context.Context) (int, error)
+	ProbeEvents     <-chan struct{}
 	InspectFallback func(context.Context, config.Config) (FallbackReport, error)
 	PollInterval    time.Duration
 	ProbeTimeout    time.Duration
@@ -60,6 +66,7 @@ type Options struct {
 type Router struct {
 	cfg             config.Config
 	probe           func(context.Context) (int, error)
+	probeEvents     <-chan struct{}
 	inspectFallback func(context.Context, config.Config) (FallbackReport, error)
 	pollInterval    time.Duration
 	probeTimeout    time.Duration
@@ -94,6 +101,7 @@ func New(cfg config.Config, options Options) *Router {
 	return &Router{
 		cfg:             cfg,
 		probe:           options.Probe,
+		probeEvents:     options.ProbeEvents,
 		inspectFallback: options.InspectFallback,
 		pollInterval:    options.PollInterval,
 		probeTimeout:    options.ProbeTimeout,
@@ -161,21 +169,73 @@ func (r *Router) Initialize() error {
 }
 
 func (r *Router) Run(ctx context.Context) error {
-	if err := r.reconcile(ctx); err != nil {
-		r.reportError(err)
+	if r.cfg.FallbackAgent == config.FallbackAgent1Password && r.probeEvents == nil {
+		return r.failUnavailable(ErrProbeEventsRequired)
 	}
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
+	retry := r.reconcileAndReport(ctx, false)
+	var retryTimer *time.Timer
+	var retryAt <-chan time.Time
+	scheduleRetry := func(enabled bool) {
+		if !enabled {
+			if retryTimer != nil && !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryAt = nil
+			return
+		}
+		if retryTimer == nil {
+			retryTimer = time.NewTimer(r.pollInterval)
+		} else {
+			if !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryTimer.Reset(r.pollInterval)
+		}
+		retryAt = retryTimer.C
+	}
+	scheduleRetry(retry)
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if err := r.reconcile(ctx); err != nil {
-				r.reportError(err)
+		case _, ok := <-r.probeEvents:
+			if !ok {
+				return r.failUnavailable(ErrProbeEventsClosed)
 			}
+			scheduleRetry(r.reconcileAndReport(ctx, false))
+		case <-retryAt:
+			retryAt = nil
+			scheduleRetry(r.reconcileAndReport(ctx, true))
 		}
 	}
+}
+
+func (r *Router) failUnavailable(err error) error {
+	r.zeroCount = 0
+	err = errors.Join(err, r.setRoute(RoutePIVFailClosed, ProbeUnavailable, FallbackReport{}, false))
+	r.reportError(err)
+	return err
+}
+
+func (r *Router) reconcileAndReport(ctx context.Context, advanceDebounce bool) bool {
+	err := r.reconcileWithDebounce(ctx, advanceDebounce)
+	if err != nil {
+		r.reportError(err)
+		return true
+	}
+	probeState := r.Current().ProbeState
+	return probeState == ProbeNotDetected || probeState == ProbeUnavailable
 }
 
 func (r *Router) Current() Snapshot {
@@ -190,6 +250,10 @@ func (r *Router) FailClosed() error {
 }
 
 func (r *Router) reconcile(ctx context.Context) error {
+	return r.reconcileWithDebounce(ctx, true)
+}
+
+func (r *Router) reconcileWithDebounce(ctx context.Context, advanceDebounce bool) error {
 	if r.cfg.FallbackAgent != config.FallbackAgent1Password {
 		r.zeroCount = 0
 		return r.setRoute(RoutePIV, ProbeNotChecked, FallbackReport{}, false)
@@ -205,17 +269,98 @@ func (r *Router) reconcile(ctx context.Context) error {
 		r.zeroCount = 0
 		return r.setRoute(RoutePIV, ProbeConnected, FallbackReport{}, false)
 	}
-	r.zeroCount++
+	if r.zeroCount == 0 {
+		r.zeroCount = 1
+	} else if advanceDebounce && r.zeroCount < r.debounceCount {
+		r.zeroCount++
+	}
 	if r.zeroCount < r.debounceCount {
 		return r.setRoute(RoutePIVFailClosed, ProbeNotDetected, FallbackReport{}, false)
 	}
-	fallbackCtx, fallbackCancel := context.WithTimeout(ctx, r.probeTimeout)
-	report, fallbackErr := r.inspectFallback(fallbackCtx, r.cfg)
-	fallbackCancel()
+	report, fallbackErr, interrupted, eventsClosed := r.inspectFallbackWhileWatching(ctx)
+	if eventsClosed {
+		r.zeroCount = 0
+		return errors.Join(ErrProbeEventsClosed, r.setRoute(RoutePIVFailClosed, ProbeUnavailable, FallbackReport{}, false))
+	}
+	if interrupted {
+		return r.reconcileProbeEvent(ctx)
+	}
 	if fallbackErr != nil || !report.Reachable || !report.TargetKeyFound || report.OtherKeys != 0 {
 		return r.setRoute(RoutePIVFailClosed, ProbeNotDetected, report, true)
 	}
+	// Fallback inspection can wait on another agent. Recheck the cached USB state
+	// before publishing that route so a reinsert during the inspection wins.
+	recheckCtx, recheckCancel := context.WithTimeout(ctx, r.probeTimeout)
+	count, err = r.probe(recheckCtx)
+	recheckCancel()
+	if err != nil {
+		r.zeroCount = 0
+		return r.setRoute(RoutePIVFailClosed, ProbeUnavailable, FallbackReport{}, false)
+	}
+	if count > 0 {
+		r.zeroCount = 0
+		return r.setRoute(RoutePIV, ProbeConnected, FallbackReport{}, false)
+	}
+	if interrupted, eventsClosed := r.consumePendingProbeEvent(); eventsClosed {
+		r.zeroCount = 0
+		return errors.Join(ErrProbeEventsClosed, r.setRoute(RoutePIVFailClosed, ProbeUnavailable, FallbackReport{}, false))
+	} else if interrupted {
+		return r.reconcileProbeEvent(ctx)
+	}
 	return r.setRoute(Route1Password, ProbeNotDetected, report, true)
+}
+
+type fallbackInspectionResult struct {
+	report FallbackReport
+	err    error
+}
+
+func (r *Router) inspectFallbackWhileWatching(ctx context.Context) (FallbackReport, error, bool, bool) {
+	fallbackCtx, cancel := context.WithTimeout(ctx, r.probeTimeout)
+	defer cancel()
+	result := make(chan fallbackInspectionResult, 1)
+	go func() {
+		report, err := r.inspectFallback(fallbackCtx, r.cfg)
+		result <- fallbackInspectionResult{report: report, err: err}
+	}()
+	select {
+	case got := <-result:
+		if interrupted, eventsClosed := r.consumePendingProbeEvent(); interrupted || eventsClosed {
+			return FallbackReport{}, nil, interrupted, eventsClosed
+		}
+		return got.report, got.err, false, false
+	case _, ok := <-r.probeEvents:
+		return FallbackReport{}, nil, ok, !ok
+	case <-fallbackCtx.Done():
+		return FallbackReport{}, fallbackCtx.Err(), false, false
+	}
+}
+
+func (r *Router) consumePendingProbeEvent() (interrupted bool, eventsClosed bool) {
+	select {
+	case _, ok := <-r.probeEvents:
+		return ok, !ok
+	default:
+		return false, false
+	}
+}
+
+func (r *Router) reconcileProbeEvent(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, r.probeTimeout)
+	count, err := r.probe(probeCtx)
+	cancel()
+	if err != nil {
+		r.zeroCount = 0
+		return r.setRoute(RoutePIVFailClosed, ProbeUnavailable, FallbackReport{}, false)
+	}
+	if count > 0 {
+		r.zeroCount = 0
+		return r.setRoute(RoutePIV, ProbeConnected, FallbackReport{}, false)
+	}
+	if r.zeroCount == 0 {
+		r.zeroCount = 1
+	}
+	return r.setRoute(RoutePIVFailClosed, ProbeNotDetected, FallbackReport{}, false)
 }
 
 func (r *Router) setRoute(route Route, probe ProbeState, fallback FallbackReport, fallbackChecked bool) error {

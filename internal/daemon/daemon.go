@@ -55,7 +55,19 @@ func Run(ctx context.Context, options Options) error {
 		_ = logger.Write(diagnostic.LevelError, diagnostic.EventDaemonFailed, diagnostic.Classify(err))
 		return err
 	}
+	deviceProbe := system.ProbeYubiKeys
+	var deviceMonitor *system.YubiKeyMonitor
+	if cfg.FallbackAgent == config.FallbackAgent1Password {
+		deviceMonitor, err = system.NewYubiKeyMonitor()
+		if err != nil {
+			_ = logger.Write(diagnostic.LevelError, diagnostic.EventDaemonFailed, diagnostic.Classify(err))
+			return fmt.Errorf("start YubiKey monitor: %w", err)
+		}
+		defer deviceMonitor.Close()
+		deviceProbe = deviceMonitor.Probe
+	}
 	manager := backend.New(cfg, deps, options.Executable, options.ConfigPath)
+	manager.SetDeviceProbe(deviceProbe)
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -75,9 +87,14 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	_ = logger.Write(diagnostic.LevelInfo, diagnostic.EventProxyListening, diagnostic.FailureNone)
+	var probeEvents <-chan struct{}
+	if deviceMonitor != nil {
+		probeEvents = deviceMonitor.Events()
+	}
 	router := agentroute.New(cfg, agentroute.Options{
-		Probe:     system.ProbeYubiKeys,
-		GuardPath: guardPath,
+		Probe:       deviceProbe,
+		ProbeEvents: probeEvents,
+		GuardPath:   guardPath,
 		OnError: func(err error) {
 			_ = logger.Write(diagnostic.LevelError, diagnostic.EventRouteFailClosed, diagnostic.Classify(err))
 		},

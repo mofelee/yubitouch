@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mofelee/yubitouch/internal/config"
+	"github.com/mofelee/yubitouch/internal/signing"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -282,6 +283,7 @@ func TestRouterRunReportsTransientErrorsAndRetries(t *testing.T) {
 	errorsSeen := make(chan error, 1)
 	router := newGuardedRouter(dir, cfg, Options{
 		Probe:        func(context.Context) (int, error) { return 1, nil },
+		ProbeEvents:  make(chan struct{}),
 		PollInterval: 5 * time.Millisecond,
 		OnError: func(err error) {
 			select {
@@ -299,6 +301,7 @@ func TestRouterRunReportsTransientErrorsAndRetries(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- router.Run(ctx) }()
 	select {
@@ -332,6 +335,589 @@ func TestRouterRunReportsTransientErrorsAndRetries(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("router did not stop after cancellation")
 	}
+}
+
+func TestRouterRetriesTransientProbeFailure(t *testing.T) {
+	dir := tempDir(t)
+	cfg := routeConfig(dir, newPublicKey(t))
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	events := make(chan struct{})
+	retryProbe := make(chan struct{})
+	var probes atomic.Int32
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(ctx context.Context) (int, error) {
+			if probes.Add(1) == 1 {
+				return 0, errors.New("transient IOKit failure")
+			}
+			select {
+			case <-retryProbe:
+				return 1, nil
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		},
+		ProbeEvents:  events,
+		PollInterval: 5 * time.Millisecond,
+		ProbeTimeout: time.Second,
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIVFailClosed && snapshot.ProbeState == ProbeUnavailable
+	})
+	deadline := time.Now().Add(time.Second)
+	for probes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("probe calls before retry release = %d, want 2", got)
+	}
+	close(retryProbe)
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	assertRoute(t, cfg, RoutePIV)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterRequiresDeviceEventsWhenFallbackIsEnabled(t *testing.T) {
+	dir := tempDir(t)
+	cfg := routeConfig(dir, newPublicKey(t))
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) { return 1, nil },
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Run(context.Background()); !errors.Is(err, ErrProbeEventsRequired) {
+		t.Fatalf("missing device events error = %v", err)
+	}
+	got := router.Current()
+	if got.Route != RoutePIVFailClosed || got.ProbeState != ProbeUnavailable {
+		t.Fatalf("missing device events snapshot = %+v", got)
+	}
+	assertRoute(t, cfg, RoutePIV)
+}
+
+func TestRouterDoesNotProbeDuringCoordinatedSigning(t *testing.T) {
+	dir := tempDir(t)
+	cfg := routeConfig(dir, newPublicKey(t))
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	events := make(chan struct{}, 1)
+	var probes atomic.Int32
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			probes.Add(1)
+			return 1, nil
+		},
+		ProbeEvents:  events,
+		PollInterval: 5 * time.Millisecond,
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+
+	signCtx, cancelSign := context.WithCancel(context.Background())
+	defer cancelSign()
+	signStarted := make(chan struct{})
+	signDone := make(chan error, 1)
+	coordinator := signing.New(nil, nil, time.Second)
+	go func() {
+		_, err := coordinator.Sign(signCtx, func() (*ssh.Signature, error) {
+			close(signStarted)
+			<-signCtx.Done()
+			return nil, signCtx.Err()
+		})
+		signDone <- err
+	}()
+	select {
+	case <-signStarted:
+	case <-time.After(time.Second):
+		t.Fatal("coordinated sign did not start")
+	}
+
+	// Keep the PIV operation active across several intervals used by the old
+	// polling router. No device probe should run without an IOKit event.
+	time.Sleep(30 * time.Millisecond)
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("router probes during coordinated sign = %d, want 1", got)
+	}
+	cancelSign()
+	select {
+	case err := <-signDone:
+		if !errors.Is(err, signing.ErrCanceled) {
+			t.Fatalf("coordinated sign error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinated sign did not stop")
+	}
+
+	events <- struct{}{}
+	deadline := time.Now().Add(time.Second)
+	for probes.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("probe calls after device event = %d, want 2", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterBufferedRemovalWaitsForDebounceTimer(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	events := make(chan struct{}, 1)
+	events <- struct{}{}
+	var probes atomic.Int32
+	var inspections atomic.Int32
+	var updates atomic.Int32
+	bufferedRemovalReconciled := make(chan struct{})
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			probes.Add(1)
+			return 0, nil
+		},
+		ProbeEvents: events,
+		InspectFallback: func(context.Context, config.Config) (FallbackReport, error) {
+			inspections.Add(1)
+			return FallbackReport{Reachable: true, TargetKeyFound: true}, nil
+		},
+		PollInterval:  50 * time.Millisecond,
+		DebounceCount: 2,
+		Now: func() time.Time {
+			call := updates.Add(1)
+			if call == 3 {
+				close(bufferedRemovalReconciled)
+			}
+			return time.Unix(int64(call), 0)
+		},
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	select {
+	case <-bufferedRemovalReconciled:
+	case <-time.After(time.Second):
+		t.Fatal("buffered removal was not reconciled")
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("probe calls after buffered removal = %d, want 2", got)
+	}
+	if got := router.Current(); got.Route != RoutePIVFailClosed || got.ProbeState != ProbeNotDetected || got.FallbackChecked {
+		t.Fatalf("buffered removal bypassed debounce: %+v", got)
+	}
+	if got := inspections.Load(); got != 0 {
+		t.Fatalf("fallback inspections before debounce timer = %d, want 0", got)
+	}
+	assertRoute(t, cfg, RoutePIV)
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == Route1Password && snapshot.FallbackChecked
+	})
+	if got := inspections.Load(); got != 1 {
+		t.Fatalf("fallback inspections after debounce timer = %d, want 1", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterDeviceRemovalDebouncesAndReinsertCancelsFallback(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	events := make(chan struct{}, 1)
+	var count atomic.Int32
+	count.Store(1)
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			return int(count.Load()), nil
+		},
+		ProbeEvents:   events,
+		PollInterval:  30 * time.Millisecond,
+		DebounceCount: 2,
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+
+	count.Store(0)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIVFailClosed && snapshot.ProbeState == ProbeNotDetected && !snapshot.FallbackChecked
+	})
+	assertRoute(t, cfg, RoutePIV)
+
+	count.Store(1)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	time.Sleep(45 * time.Millisecond)
+	if got := router.Current(); got.Route != RoutePIV || got.ProbeState != ProbeConnected {
+		t.Fatalf("reinsert during debounce reached fallback: %+v", got)
+	}
+
+	count.Store(0)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == Route1Password && snapshot.ProbeState == ProbeNotDetected && snapshot.FallbackChecked
+	})
+	assertRoute(t, cfg, Route1Password)
+
+	count.Store(1)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	assertRoute(t, cfg, RoutePIV)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterReinsertInterruptsFallbackInspection(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	events := make(chan struct{}, 1)
+	inspectionStarted := make(chan struct{}, 1)
+	inspectionCanceled := make(chan struct{}, 1)
+	var count atomic.Int32
+	count.Store(1)
+	var fallbackRouteSeen atomic.Bool
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			return int(count.Load()), nil
+		},
+		ProbeEvents: events,
+		InspectFallback: func(ctx context.Context, _ config.Config) (FallbackReport, error) {
+			inspectionStarted <- struct{}{}
+			<-ctx.Done()
+			inspectionCanceled <- struct{}{}
+			return FallbackReport{}, ctx.Err()
+		},
+		PollInterval:  10 * time.Millisecond,
+		ProbeTimeout:  time.Second,
+		DebounceCount: 2,
+		OnUpdate: func(snapshot Snapshot) {
+			if snapshot.Route == Route1Password {
+				fallbackRouteSeen.Store(true)
+			}
+		},
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	count.Store(0)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIVFailClosed && snapshot.ProbeState == ProbeNotDetected && !snapshot.FallbackChecked
+	})
+	assertRoute(t, cfg, RoutePIV)
+	select {
+	case <-inspectionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fallback inspection did not start")
+	}
+	count.Store(1)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	select {
+	case <-inspectionCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("fallback inspection was not canceled after reinsert")
+	}
+	if fallbackRouteSeen.Load() {
+		t.Fatal("router published fallback after a reinsert during fallback inspection")
+	}
+	assertRoute(t, cfg, RoutePIV)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterRechecksDeviceBeforePublishingFallback(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	inspectionStarted := make(chan struct{})
+	releaseInspection := make(chan struct{})
+	var count atomic.Int32
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			return int(count.Load()), nil
+		},
+		ProbeEvents: make(chan struct{}),
+		InspectFallback: func(ctx context.Context, _ config.Config) (FallbackReport, error) {
+			close(inspectionStarted)
+			select {
+			case <-releaseInspection:
+				return FallbackReport{Reachable: true, TargetKeyFound: true}, nil
+			case <-ctx.Done():
+				return FallbackReport{}, ctx.Err()
+			}
+		},
+		DebounceCount: 1,
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
+	defer cancelReconcile()
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- router.reconcile(reconcileCtx) }()
+	select {
+	case <-inspectionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fallback inspection did not start")
+	}
+	count.Store(1)
+	close(releaseInspection)
+	if err := <-reconcileDone; err != nil {
+		t.Fatal(err)
+	}
+	got := router.Current()
+	if got.Route != RoutePIV || got.ProbeState != ProbeConnected || got.FallbackChecked {
+		t.Fatalf("route after final device recheck = %+v", got)
+	}
+	assertRoute(t, cfg, RoutePIV)
+}
+
+func TestRouterRejectsFallbackWhenEventStreamClosesDuringFinalProbe(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	events := make(chan struct{})
+	finalProbeStarted := make(chan struct{})
+	releaseFinalProbe := make(chan struct{})
+	var probes atomic.Int32
+	var fallbackRouteSeen atomic.Bool
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(ctx context.Context) (int, error) {
+			if probes.Add(1) == 1 {
+				return 0, nil
+			}
+			close(finalProbeStarted)
+			select {
+			case <-releaseFinalProbe:
+				return 0, nil
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		},
+		ProbeEvents: events,
+		InspectFallback: func(context.Context, config.Config) (FallbackReport, error) {
+			return FallbackReport{Reachable: true, TargetKeyFound: true}, nil
+		},
+		DebounceCount: 1,
+		OnUpdate: func(snapshot Snapshot) {
+			if snapshot.Route == Route1Password {
+				fallbackRouteSeen.Store(true)
+			}
+		},
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
+	defer cancelReconcile()
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- router.reconcile(reconcileCtx) }()
+	select {
+	case <-finalProbeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("final device probe did not start")
+	}
+	close(events)
+	close(releaseFinalProbe)
+	select {
+	case err := <-reconcileDone:
+		if !errors.Is(err, ErrProbeEventsClosed) {
+			t.Fatalf("closed event stream error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not stop after event stream closed")
+	}
+	got := router.Current()
+	if got.Route != RoutePIVFailClosed || got.ProbeState != ProbeUnavailable || got.FallbackChecked {
+		t.Fatalf("closed event stream snapshot = %+v", got)
+	}
+	if fallbackRouteSeen.Load() {
+		t.Fatal("router published fallback after device event stream closed")
+	}
+	assertRoute(t, cfg, RoutePIV)
+}
+
+func TestRouterFailsClosedWhenEventStreamClosesDuringFallbackInspection(t *testing.T) {
+	dir := tempDir(t)
+	target := newPublicKey(t)
+	cfg := routeConfig(dir, target)
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	serveAgent(t, cfg.FallbackAgentSocket, &testAgent{keys: []*agent.Key{agentKey(target)}})
+	events := make(chan struct{}, 1)
+	inspectionStarted := make(chan struct{}, 1)
+	inspectionCanceled := make(chan struct{}, 1)
+	var count atomic.Int32
+	count.Store(1)
+	var fallbackRouteSeen atomic.Bool
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe: func(context.Context) (int, error) {
+			return int(count.Load()), nil
+		},
+		ProbeEvents: events,
+		InspectFallback: func(ctx context.Context, _ config.Config) (FallbackReport, error) {
+			inspectionStarted <- struct{}{}
+			<-ctx.Done()
+			inspectionCanceled <- struct{}{}
+			return FallbackReport{}, ctx.Err()
+		},
+		PollInterval:  10 * time.Millisecond,
+		ProbeTimeout:  time.Second,
+		DebounceCount: 2,
+		OnUpdate: func(snapshot Snapshot) {
+			if snapshot.Route == Route1Password {
+				fallbackRouteSeen.Store(true)
+			}
+		},
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	count.Store(0)
+	events <- struct{}{}
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIVFailClosed && snapshot.ProbeState == ProbeNotDetected && !snapshot.FallbackChecked
+	})
+	select {
+	case <-inspectionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fallback inspection did not start")
+	}
+	close(events)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrProbeEventsClosed) {
+			t.Fatalf("closed event stream error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("router did not stop after event stream closed during fallback inspection")
+	}
+	select {
+	case <-inspectionCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("fallback inspection was not canceled after event stream closed")
+	}
+	got := router.Current()
+	if got.Route != RoutePIVFailClosed || got.ProbeState != ProbeUnavailable || got.FallbackChecked {
+		t.Fatalf("closed event stream snapshot = %+v", got)
+	}
+	if fallbackRouteSeen.Load() {
+		t.Fatal("router published fallback after device event stream closed")
+	}
+	assertRoute(t, cfg, RoutePIV)
+}
+
+func TestRouterFailsClosedWhenDeviceEventStreamCloses(t *testing.T) {
+	dir := tempDir(t)
+	cfg := routeConfig(dir, newPublicKey(t))
+	serveAgent(t, cfg.PIVSocketPath, &testAgent{})
+	events := make(chan struct{})
+	router := newGuardedRouter(dir, cfg, Options{
+		Probe:       func(context.Context) (int, error) { return 1, nil },
+		ProbeEvents: events,
+	})
+	if err := router.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- router.Run(ctx) }()
+	waitForRouterSnapshot(t, router, func(snapshot Snapshot) bool {
+		return snapshot.Route == RoutePIV && snapshot.ProbeState == ProbeConnected
+	})
+	close(events)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrProbeEventsClosed) {
+			t.Fatalf("closed event stream error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("router did not stop after device event stream closed")
+	}
+	got := router.Current()
+	if got.Route != RoutePIVFailClosed || got.ProbeState != ProbeUnavailable || got.FallbackChecked {
+		t.Fatalf("closed event stream snapshot = %+v", got)
+	}
+	assertRoute(t, cfg, RoutePIV)
 }
 
 func TestAtomicRoutePreservesExistingConnections(t *testing.T) {
@@ -441,6 +1027,21 @@ func assertRoute(t *testing.T, cfg config.Config, want Route) {
 	}
 	if report.Route != want || !report.Managed || !report.TargetReachable {
 		t.Fatalf("public route = %+v, want %q", report, want)
+	}
+}
+
+func waitForRouterSnapshot(t *testing.T, router *Router, matches func(Snapshot) bool) Snapshot {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		snapshot := router.Current()
+		if matches(snapshot) {
+			return snapshot
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("router snapshot did not reach expected state: %+v", snapshot)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

@@ -55,6 +55,12 @@ func New(cfg config.Config, deps system.Dependencies, executable string, configP
 	}
 }
 
+func (m *Manager) SetDeviceProbe(probe func(context.Context) (int, error)) {
+	if probe != nil {
+		m.probeKeys = probe
+	}
+}
+
 func (m *Manager) Connect(ctx context.Context) (agentproxy.Backend, error) {
 	if err := m.EnsureAgent(ctx); err != nil {
 		return nil, err

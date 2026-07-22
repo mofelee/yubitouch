@@ -109,7 +109,7 @@ yubitouch status --json | jq '{
 3. 运行 `yubitouch doctor`，确认公共路由、PIV socket、1Password socket、目标 key、
    零个其他 key、`IdentityFile` 和 `IdentitiesOnly` 全部通过。
 4. 在稳定缺卡且 `agent_route=1password` 时分别执行 `yubitouch reload` 和
-   `yubitouch stop`。`reload` 恢复后只能在再次完成两次缺卡探测及回退检查后
+   `yubitouch stop`。`reload` 恢复后只能在再次完成缺卡防抖及回退检查后
    返回 1Password；`stop` 后公共链接不得仍指向 1Password。最后运行 `yubitouch ensure`
    恢复服务。
 
@@ -117,10 +117,10 @@ yubitouch status --json | jq '{
 
 1. 插入 YubiKey，运行 `yubitouch reload`，确认 `agent_route=piv`、
    `route_probe_state=connected` 且公共链接指向 `piv-agent.sock`。
-2. 拔出 YubiKey，高频率观察上面的脱敏状态。第一次明确 `not_detected` 必须先进入
-   `piv_fail_closed`，公共链接仍指向 PIV；只有第二次连续缺卡才能进入
+2. 拔出 YubiKey，高频率观察上面的脱敏状态。IOKit 明确报告 `not_detected` 后必须先进入
+   `piv_fail_closed`，公共链接仍指向 PIV；只有防抖时间结束后仍缺卡才能进入
    `agent_route=1password`。
-3. 另做一次短暂拔插：在第一次 `not_detected` 后、第二次探测前重插。此次不得
+3. 另做一次短暂拔插：在首次 `not_detected` 后、防抖时间结束前重插。此次不得
    出现 `agent_route=1password`，恢复后应直接返回 `piv`。
 4. 在稳定缺卡路由上运行 `yubitouch test-sign`。确认出现 1Password Touch ID/授权、
    签名成功、没有 YubiTouch 触摸浮层，且 `last_sign_at` 不因这次直接签名更新。
@@ -245,9 +245,13 @@ rm -rf -- "$tmp_repo"
    ```
 
    确认只列出配置公钥，且没有 PIN、Touch ID、UI 或 backend provider 加载。
-4. 对记录的 daemon PID 发送 `SIGKILL`，确认 launchd 拉起新 PID、公共受管路由恢复，随后重复
+4. 启用 1Password 回退并保持 daemon 运行至少 10 秒，然后执行测试设备上已知安全的
+   `ykman piv` 读取或管理操作。确认操作不会出现 `SCARD_W_UNPOWERED_CARD`、
+   `Card is unpowered` 或伪装成 `PIN verification failed` 的连接错误；不要在验证记录中写入 PIN
+   或设备序列号。
+5. 对记录的 daemon PID 发送 `SIGKILL`，确认 launchd 拉起新 PID、公共受管路由恢复，随后重复
    identity 查询并确认仍无 provider 副作用。只操作该次 `launchctl print` 确认的 daemon PID。
-5. 分别运行 `yubitouch reload`、`yubitouch stop` 和 `yubitouch ensure`，确认 socket/进程状态
+6. 分别运行 `yubitouch reload`、`yubitouch stop` 和 `yubitouch ensure`，确认 socket/进程状态
    与命令语义一致，最终没有孤儿受管进程。
 
 | 场景 | daemon PID 变化 | 公共 socket | backend/provider | PIN/UI 副作用 | 结果/Issue |
