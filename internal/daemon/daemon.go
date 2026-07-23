@@ -82,6 +82,17 @@ func Run(ctx context.Context, options Options) error {
 		deviceProbe = deviceMonitor.Probe
 		deviceEvents = fanOutDeviceEvents(deviceMonitor.Events())
 	}
+	var ageHardwareManager *agehelper.HardwareManager
+	var ageHardwareWatcher *ageHardwareSessionWatcher
+	if cfg.Age != nil {
+		ageHardwareManager = agehelper.NewHardwareManager(
+			options.Executable,
+			options.ConfigPath,
+			cfg.SignTimeout.Duration,
+		)
+		ageHardwareWatcher = startAgeHardwareSessionWatcher(deviceEvents.Age, ageHardwareManager)
+		defer ageHardwareWatcher.stop()
+	}
 	manager := backend.New(cfg, deps, options.Executable, options.ConfigPath)
 	manager.SetDeviceProbe(deviceProbe)
 	defer func() {
@@ -184,19 +195,16 @@ func Run(ctx context.Context, options Options) error {
 	if ageListener != nil {
 		publicProbe := ageprobe.NewRunner(options.Executable, options.ConfigPath, 5*time.Second)
 		ageService := ageservice.New(ageservice.Options{
-			Config:      cfg,
-			Probe:       publicProbe,
-			Coordinator: coordinator,
-			NewRunner: func(path ageprofile.Path) ageservice.Runner {
-				mode := agehelper.ModeHardware
-				if path == ageprofile.PathRecovery {
-					mode = agehelper.ModeRecovery
-				}
-				return &ageRunner{
-					mode:   mode,
-					runner: agehelper.NewRunner(options.Executable, options.ConfigPath, cfg.SignTimeout.Duration),
-				}
-			},
+			Config:              cfg,
+			Probe:               publicProbe,
+			Coordinator:         coordinator,
+			HardwareInvalidator: ageHardwareInvalidator(ageHardwareManager),
+			NewRunner: newAgeRunnerFactory(
+				ageHardwareManager,
+				options.Executable,
+				options.ConfigPath,
+				cfg.SignTimeout.Duration,
+			),
 			Sink: ageSink{store, diagnostic.NewAgeSink(logger)},
 		})
 		ageServer := &ageipc.Server{
@@ -217,6 +225,7 @@ func Run(ctx context.Context, options Options) error {
 		listenerCloser(listener),
 		listenerCloser(ageListener),
 	)
+	shutdownErr = errors.Join(shutdownErr, ageHardwareWatcher.stop())
 	shutdownComplete = true
 	err = errors.Join(err, shutdownErr)
 	if err != nil {
@@ -228,16 +237,66 @@ func Run(ctx context.Context, options Options) error {
 }
 
 type ageRunner struct {
-	mode   agehelper.Mode
-	runner *agehelper.Runner
-	call   *agehelper.Call
+	mode               agehelper.Mode
+	hardwareManager    *agehelper.HardwareManager
+	invalidateHardware func() error
+	runner             *agehelper.Runner
+	call               ageRunnerCall
+}
+
+type ageRunnerCall interface {
+	WaitReady() error
+	Wait() ([]byte, error)
+}
+
+func newAgeRunnerFactory(
+	hardwareManager *agehelper.HardwareManager,
+	executable string,
+	configPath string,
+	timeout time.Duration,
+) ageservice.RunnerFactory {
+	return func(path ageprofile.Path) ageservice.Runner {
+		switch path {
+		case ageprofile.PathHardware:
+			if hardwareManager == nil {
+				return nil
+			}
+			return &ageRunner{
+				mode:               agehelper.ModeHardware,
+				hardwareManager:    hardwareManager,
+				invalidateHardware: ageHardwareInvalidator(hardwareManager),
+			}
+		case ageprofile.PathRecovery:
+			return &ageRunner{
+				mode:   agehelper.ModeRecovery,
+				runner: agehelper.NewRunner(executable, configPath, timeout),
+			}
+		default:
+			return nil
+		}
+	}
 }
 
 func (r *ageRunner) Start(ctx context.Context, envelope ageprofile.Envelope) ageipc.ErrorClass {
-	if r == nil || r.runner == nil || r.call != nil {
+	if r == nil || r.call != nil {
 		return ageipc.ClassInternal
 	}
-	call, err := r.runner.Start(ctx, r.mode, agehelper.Request{Envelope: envelope})
+	var call ageRunnerCall
+	var err error
+	switch r.mode {
+	case agehelper.ModeHardware:
+		if r.hardwareManager == nil || r.runner != nil {
+			return ageipc.ClassInternal
+		}
+		call, err = r.hardwareManager.Start(ctx, agehelper.Request{Envelope: envelope})
+	case agehelper.ModeRecovery:
+		if r.runner == nil || r.hardwareManager != nil {
+			return ageipc.ClassInternal
+		}
+		call, err = r.runner.Start(ctx, r.mode, agehelper.Request{Envelope: envelope})
+	default:
+		return ageipc.ClassInternal
+	}
 	if err != nil {
 		return mapHelperError(r.mode, agehelper.ErrorClassOf(err))
 	}
@@ -262,13 +321,7 @@ func (r *ageRunner) Wait() ([]byte, ageipc.ErrorClass) {
 	}
 	call := r.call
 	r.call = nil
-	var fileKey []byte
-	var err error
-	if r.mode == agehelper.ModeHardware {
-		fileKey, err = call.ContinueAndWait()
-	} else {
-		fileKey, err = call.Wait()
-	}
+	fileKey, err := call.Wait()
 	if err != nil {
 		agehelper.ClearSecret(fileKey)
 		return nil, mapHelperError(r.mode, agehelper.ErrorClassOf(err))
@@ -283,7 +336,14 @@ func (r *ageRunner) Wait() ([]byte, ageipc.ErrorClass) {
 }
 
 func (r *ageRunner) CancelCurrent() {
-	if r != nil && r.runner != nil {
+	if r == nil {
+		return
+	}
+	if r.mode == agehelper.ModeHardware && r.invalidateHardware != nil {
+		// Cancellation may race a successful result after the manager has cleared
+		// its active call. Invalidate unconditionally reaps that retained session.
+		_ = r.invalidateHardware()
+	} else if r.mode == agehelper.ModeRecovery && r.runner != nil {
 		r.runner.CancelCurrent()
 	}
 }

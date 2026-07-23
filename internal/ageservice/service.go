@@ -48,11 +48,12 @@ type Probe interface {
 	Probe(context.Context, agehardware.Target) (agehardware.ProbeResult, error)
 }
 
-// Runner is a one-shot, killable helper process. Hardware runners use a
-// two-phase exchange: Start launches the helper, WaitReady returns only after
-// PIN authorization, and Wait permits the private-key operation before
-// returning its result. Recovery runners use Start followed directly by Wait.
-// Implementations must only return a file key and predefined IPC error classes.
+// Runner is one killable unwrap operation. Hardware runners may use a shared,
+// daemon-owned authenticated helper: Start binds one request, WaitReady returns
+// only after PIN resolution has exited and the session is ready for touch, and
+// Wait permits that request's private-key operation. Recovery runners remain
+// one-shot and use Start followed directly by Wait. Implementations must only
+// return a file key and predefined IPC error classes.
 type Runner interface {
 	Start(context.Context, ageprofile.Envelope) ageipc.ErrorClass
 	WaitReady() ageipc.ErrorClass
@@ -63,25 +64,27 @@ type Runner interface {
 type RunnerFactory func(ageprofile.Path) Runner
 
 type Options struct {
-	Config        config.Config
-	Probe         Probe
-	Coordinator   *signing.Coordinator
-	NewRunner     RunnerFactory
-	Sink          Sink
-	ProbeTimeout  time.Duration
-	ProbeInterval time.Duration
-	Now           func() time.Time
+	Config              config.Config
+	Probe               Probe
+	Coordinator         *signing.Coordinator
+	NewRunner           RunnerFactory
+	HardwareInvalidator func() error
+	Sink                Sink
+	ProbeTimeout        time.Duration
+	ProbeInterval       time.Duration
+	Now                 func() time.Time
 }
 
 type Service struct {
-	cfg           config.Config
-	probe         Probe
-	coordinator   *signing.Coordinator
-	newRunner     RunnerFactory
-	sink          Sink
-	probeTimeout  time.Duration
-	probeInterval time.Duration
-	now           func() time.Time
+	cfg                 config.Config
+	probe               Probe
+	coordinator         *signing.Coordinator
+	newRunner           RunnerFactory
+	hardwareInvalidator func() error
+	sink                Sink
+	probeTimeout        time.Duration
+	probeInterval       time.Duration
+	now                 func() time.Time
 }
 
 func New(options Options) *Service {
@@ -95,14 +98,15 @@ func New(options Options) *Service {
 		options.Now = time.Now
 	}
 	return &Service{
-		cfg:           options.Config,
-		probe:         options.Probe,
-		coordinator:   options.Coordinator,
-		newRunner:     options.NewRunner,
-		sink:          options.Sink,
-		probeTimeout:  options.ProbeTimeout,
-		probeInterval: options.ProbeInterval,
-		now:           options.Now,
+		cfg:                 options.Config,
+		probe:               options.Probe,
+		coordinator:         options.Coordinator,
+		newRunner:           options.NewRunner,
+		hardwareInvalidator: options.HardwareInvalidator,
+		sink:                options.Sink,
+		probeTimeout:        options.ProbeTimeout,
+		probeInterval:       options.ProbeInterval,
+		now:                 options.Now,
 	}
 }
 
@@ -115,7 +119,12 @@ func (s *Service) Unwrap(ctx context.Context, requester signing.Requester, reque
 		s.publish(BackendNone, class)
 		return nil, class
 	}
+	if class := contextClass(ctx); class != "" {
+		s.publish(BackendNone, class)
+		return nil, class
+	}
 	if s.probe == nil {
+		_ = s.invalidateHardware()
 		s.publish(BackendNone, ageipc.ClassProbeUnavailable)
 		return nil, ageipc.ClassProbeUnavailable
 	}
@@ -225,10 +234,19 @@ func (s *Service) probeOnce(ctx context.Context, target agehardware.Target) (age
 	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
 	defer cancel()
 	result, err := s.probe.Probe(probeCtx, target)
+	probeContextErr := probeCtx.Err()
+	// This request does not own the shared hardware manager until it enters the
+	// coordinator. Its cancellation must not invalidate another active request.
 	if class := contextClass(ctx); class != "" {
 		return agehardware.Unavailable, class
 	}
-	if probeCtx.Err() != nil {
+	trustedConnected := result.State == agehardware.Connected && err == nil && probeContextErr == nil
+	if !trustedConnected {
+		if s.invalidateHardware() != nil {
+			return agehardware.Unavailable, ageipc.ClassProbeUnavailable
+		}
+	}
+	if probeContextErr != nil {
 		return agehardware.Unavailable, ageipc.ClassProbeUnavailable
 	}
 	switch result.State {
@@ -249,6 +267,13 @@ func (s *Service) probeOnce(ctx context.Context, target agehardware.Target) (age
 		return agehardware.Mismatch, ageipc.ClassTargetMismatch
 	}
 	return agehardware.Unavailable, ageipc.ClassProbeUnavailable
+}
+
+func (s *Service) invalidateHardware() error {
+	if s.hardwareInvalidator != nil {
+		return s.hardwareInvalidator()
+	}
+	return nil
 }
 
 func (s *Service) unwrapHardware(ctx context.Context, requester signing.Requester, envelope ageprofile.Envelope) ([]byte, ageipc.ErrorClass) {

@@ -66,6 +66,271 @@ func TestReinsertOnSecondProbeReturnsToHardware(t *testing.T) {
 	}
 }
 
+func TestFirstMissingProbeInvalidatesRetainedSessionBeforeRetry(t *testing.T) {
+	cfg, request := testProfile(t, false)
+	invalidations := 0
+	probeCalls := 0
+	probe := probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+		probeCalls++
+		if probeCalls == 1 {
+			return agehardware.ProbeResult{State: agehardware.NotDetected}, nil
+		}
+		if invalidations != 1 {
+			t.Fatalf("second probe started after %d invalidations, want 1", invalidations)
+		}
+		return agehardware.ProbeResult{State: agehardware.Connected}, nil
+	})
+	hardware := &fakeRunner{key: bytes.Repeat([]byte{0x31}, 16)}
+	service := New(Options{
+		Config:      cfg,
+		Probe:       probe,
+		Coordinator: signing.New(nil, nil, time.Second),
+		NewRunner:   pathFactory(hardware, &fakeRunner{}),
+		HardwareInvalidator: func() error {
+			invalidations++
+			return nil
+		},
+		ProbeInterval: time.Millisecond,
+	})
+
+	fileKey, class := service.Unwrap(context.Background(), signing.Requester{}, request)
+	clear(fileKey)
+	if class != "" || probeCalls != 2 || invalidations != 1 || hardware.calls != 1 {
+		t.Fatalf(
+			"class=%q probes=%d invalidations=%d hardware=%d",
+			class,
+			probeCalls,
+			invalidations,
+			hardware.calls,
+		)
+	}
+}
+
+func TestProbeTrustControlsRetainedSessionInvalidation(t *testing.T) {
+	tests := []struct {
+		name              string
+		probe             Probe
+		wantState         agehardware.ProbeState
+		wantClass         ageipc.ErrorClass
+		wantInvalidations int
+		invalidateErr     error
+	}{
+		{
+			name: "connected",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.Connected}, nil
+			}),
+			wantState: agehardware.Connected,
+		},
+		{
+			name: "not detected",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.NotDetected}, nil
+			}),
+			wantState:         agehardware.NotDetected,
+			wantInvalidations: 1,
+		},
+		{
+			name: "mismatch",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.Mismatch}, agehardware.ErrTargetMismatch
+			}),
+			wantState:         agehardware.Mismatch,
+			wantClass:         ageipc.ClassTargetMismatch,
+			wantInvalidations: 1,
+		},
+		{
+			name: "unavailable",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.Unavailable}, agehardware.ErrProbeUnavailable
+			}),
+			wantState:         agehardware.Unavailable,
+			wantClass:         ageipc.ClassProbeUnavailable,
+			wantInvalidations: 1,
+		},
+		{
+			name: "connected with error",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.Connected}, errors.New("probe failed")
+			}),
+			wantState:         agehardware.Unavailable,
+			wantClass:         ageipc.ClassProbeUnavailable,
+			wantInvalidations: 1,
+		},
+		{
+			name: "timeout",
+			probe: probeFunc(func(ctx context.Context, _ agehardware.Target) (agehardware.ProbeResult, error) {
+				<-ctx.Done()
+				return agehardware.ProbeResult{State: agehardware.Unavailable}, ctx.Err()
+			}),
+			wantState:         agehardware.Unavailable,
+			wantClass:         ageipc.ClassProbeUnavailable,
+			wantInvalidations: 1,
+		},
+		{
+			name: "cleanup failure",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				return agehardware.ProbeResult{State: agehardware.NotDetected}, nil
+			}),
+			wantState:         agehardware.Unavailable,
+			wantClass:         ageipc.ClassProbeUnavailable,
+			wantInvalidations: 1,
+			invalidateErr:     errors.New("helper was not reaped"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalidations := 0
+			service := New(Options{
+				Probe: test.probe,
+				HardwareInvalidator: func() error {
+					invalidations++
+					return test.invalidateErr
+				},
+				ProbeTimeout: 5 * time.Millisecond,
+			})
+			state, class := service.probeOnce(context.Background(), agehardware.Target{})
+			if state != test.wantState || class != test.wantClass || invalidations != test.wantInvalidations {
+				t.Fatalf(
+					"probeOnce = state:%q class:%q invalidations:%d, want %q %q %d",
+					state,
+					class,
+					invalidations,
+					test.wantState,
+					test.wantClass,
+					test.wantInvalidations,
+				)
+			}
+		})
+	}
+}
+
+func TestCallerContextEndingDuringProbeDoesNotInvalidateHardware(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		want       ageipc.ErrorClass
+		newContext func() (context.Context, context.CancelFunc)
+		cancelNow  bool
+	}{
+		{
+			name: "canceled", want: ageipc.ClassCanceled, cancelNow: true,
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+		},
+		{
+			name: "deadline", want: ageipc.ClassTimeout,
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			invalidations := 0
+			service := New(Options{
+				Probe: probeFunc(func(ctx context.Context, _ agehardware.Target) (agehardware.ProbeResult, error) {
+					close(entered)
+					<-ctx.Done()
+					return agehardware.ProbeResult{State: agehardware.Unavailable}, ctx.Err()
+				}),
+				HardwareInvalidator: func() error {
+					invalidations++
+					return nil
+				},
+				ProbeTimeout: time.Second,
+			})
+			ctx, cancel := test.newContext()
+			defer cancel()
+			if test.cancelNow {
+				go func() {
+					<-entered
+					cancel()
+				}()
+			}
+
+			state, class := service.probeOnce(ctx, agehardware.Target{})
+			if state != agehardware.Unavailable || class != test.want || invalidations != 0 {
+				t.Fatalf("probeOnce = state:%q class:%q invalidations:%d, want unavailable %q 0", state, class, invalidations, test.want)
+			}
+		})
+	}
+}
+
+func TestCanceledBeforeProbeDoesNotProbeOrInvalidateHardware(t *testing.T) {
+	cfg, request := testProfile(t, false)
+	for _, test := range []struct {
+		name  string
+		probe Probe
+	}{
+		{name: "probe unavailable"},
+		{
+			name: "probe configured",
+			probe: probeFunc(func(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
+				t.Fatal("pre-canceled request called Probe")
+				return agehardware.ProbeResult{}, nil
+			}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalidations := 0
+			service := New(Options{
+				Config:      cfg,
+				Probe:       test.probe,
+				Coordinator: signing.New(nil, nil, time.Second),
+				NewRunner:   pathFactory(&fakeRunner{}, &fakeRunner{}),
+				HardwareInvalidator: func() error {
+					invalidations++
+					return nil
+				},
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			fileKey, class := service.Unwrap(ctx, signing.Requester{}, request)
+			clear(fileKey)
+			if class != ageipc.ClassCanceled || invalidations != 0 {
+				t.Fatalf("Unwrap class=%q invalidations=%d, want canceled and 0", class, invalidations)
+			}
+		})
+	}
+}
+
+func TestFailedProbeInvalidationNeverRetriesOrUsesRecovery(t *testing.T) {
+	cfg, request := testProfile(t, true)
+	probe := &fakeProbe{states: []agehardware.ProbeState{
+		agehardware.NotDetected,
+		agehardware.Connected,
+	}}
+	hardware := &fakeRunner{key: bytes.Repeat([]byte{1}, 16)}
+	recovery := &fakeRunner{key: bytes.Repeat([]byte{2}, 16)}
+	invalidations := 0
+	service := New(Options{
+		Config:      cfg,
+		Probe:       probe,
+		Coordinator: signing.New(nil, nil, time.Second),
+		NewRunner:   pathFactory(hardware, recovery),
+		HardwareInvalidator: func() error {
+			invalidations++
+			return errors.New("helper was not reaped")
+		},
+		ProbeInterval: time.Millisecond,
+	})
+
+	_, class := service.Unwrap(context.Background(), signing.Requester{}, request)
+	if class != ageipc.ClassProbeUnavailable || probe.calls != 1 || invalidations != 1 ||
+		hardware.calls != 0 || recovery.calls != 0 {
+		t.Fatalf(
+			"class=%q probes=%d invalidations=%d hardware=%d recovery=%d",
+			class,
+			probe.calls,
+			invalidations,
+			hardware.calls,
+			recovery.calls,
+		)
+	}
+}
+
 func TestUnsafeProbeStatesNeverStartRecovery(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -235,6 +500,62 @@ func TestCancelAfterHardwareReadyDoesNotContinueAndReleasesPIVQueue(t *testing.T
 	}
 }
 
+func TestCancelRacingSuccessfulHardwareResultDiscardsResult(t *testing.T) {
+	cfg, request := testProfile(t, true)
+	waitEntered := make(chan struct{})
+	waitGate := make(chan struct{})
+	hardware := &fakeRunner{
+		key:         bytes.Repeat([]byte{0x42}, 16),
+		waitEntered: waitEntered,
+		waitGate:    waitGate,
+	}
+	recovery := &fakeRunner{key: bytes.Repeat([]byte{1}, 16)}
+	coordinator := signing.New(nil, nil, time.Second)
+	service := New(Options{
+		Config:        cfg,
+		Probe:         &fakeProbe{states: []agehardware.ProbeState{agehardware.Connected}},
+		Coordinator:   coordinator,
+		NewRunner:     pathFactory(hardware, recovery),
+		ProbeInterval: time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan ageipc.ErrorClass, 1)
+	go func() {
+		fileKey, class := service.Unwrap(ctx, signing.Requester{}, request)
+		clear(fileKey)
+		result <- class
+	}()
+	<-waitEntered
+	cancel()
+	hardware.mu.Lock()
+	canceled := hardware.canceled
+	hardware.mu.Unlock()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("successful-result race did not cancel the hardware runner")
+	}
+	close(waitGate)
+	if class := <-result; class != ageipc.ClassCanceled {
+		t.Fatalf("class = %q, want %q", class, ageipc.ClassCanceled)
+	}
+	if err := coordinator.RunCancelableFor(
+		context.Background(), signing.Requester{}, signing.OperationSSHSign, nil, func() error { return nil }, nil,
+	); err != nil {
+		t.Fatalf("next PIV request failed: %v", err)
+	}
+	hardware.mu.Lock()
+	waits, cancels := hardware.waitCalls, hardware.cancels
+	hardware.mu.Unlock()
+	recovery.mu.Lock()
+	recoveryCalls := recovery.calls
+	recovery.mu.Unlock()
+	if waits != 1 || cancels != 1 || recoveryCalls != 0 {
+		t.Fatalf("waits=%d cancels=%d recovery=%d", waits, cancels, recoveryCalls)
+	}
+}
+
 func TestConnectedHardwareAcceptsHistoricalRecoveryLayouts(t *testing.T) {
 	withoutRecoveryConfig, withoutRecoveryRequest := testProfile(t, false)
 	withRecoveryConfig, withRecoveryRequest := testProfile(t, true)
@@ -290,17 +611,29 @@ func TestRequestBindingIsCheckedBeforeProbe(t *testing.T) {
 	cfg, request := testProfile(t, true)
 	request.Hardware.KeyID[0] ^= 0xff
 	probe := &fakeProbe{states: []agehardware.ProbeState{agehardware.Connected}}
-	service := testService(cfg, probe, pathFactory(&fakeRunner{}, &fakeRunner{}))
+	invalidations := 0
+	service := New(Options{
+		Config:      cfg,
+		Probe:       probe,
+		Coordinator: signing.New(nil, nil, time.Second),
+		NewRunner:   pathFactory(&fakeRunner{}, &fakeRunner{}),
+		HardwareInvalidator: func() error {
+			invalidations++
+			return nil
+		},
+		ProbeInterval: time.Millisecond,
+	})
 
 	_, class := service.Unwrap(context.Background(), signing.Requester{}, request)
-	if class != ageipc.ClassInvalidRequest || probe.calls != 0 {
-		t.Fatalf("class=%q probe calls=%d", class, probe.calls)
+	if class != ageipc.ClassInvalidRequest || probe.calls != 0 || invalidations != 0 {
+		t.Fatalf("class=%q probe calls=%d invalidations=%d", class, probe.calls, invalidations)
 	}
 }
 
 func TestQueuedCancellationDoesNotStartHardwareHelper(t *testing.T) {
 	cfg, request := testProfile(t, false)
-	coordinator := signing.New(nil, nil, time.Second)
+	lifecycle := &signingEventRecorder{}
+	coordinator := signing.New(nil, lifecycle, time.Second)
 	blocking := make(chan struct{})
 	started := make(chan struct{})
 	firstDone := make(chan error, 1)
@@ -312,12 +645,18 @@ func TestQueuedCancellationDoesNotStartHardwareHelper(t *testing.T) {
 		}, nil)
 	}()
 	<-started
+	eventsBeforeQueuedRequest := lifecycle.types()
 	hardware := &fakeRunner{key: bytes.Repeat([]byte{1}, 16)}
+	invalidations := 0
 	service := New(Options{
-		Config:        cfg,
-		Probe:         &fakeProbe{states: []agehardware.ProbeState{agehardware.Connected}},
-		Coordinator:   coordinator,
-		NewRunner:     pathFactory(hardware, &fakeRunner{}),
+		Config:      cfg,
+		Probe:       &fakeProbe{states: []agehardware.ProbeState{agehardware.Connected}},
+		Coordinator: coordinator,
+		NewRunner:   pathFactory(hardware, &fakeRunner{}),
+		HardwareInvalidator: func() error {
+			invalidations++
+			return nil
+		},
 		ProbeInterval: time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -331,12 +670,139 @@ func TestQueuedCancellationDoesNotStartHardwareHelper(t *testing.T) {
 	if class := <-result; class != ageipc.ClassCanceled {
 		t.Fatalf("class = %q", class)
 	}
-	if hardware.calls != 0 {
-		t.Fatalf("queued helper started %d time(s)", hardware.calls)
+	if hardware.calls != 0 || hardware.readyCalls != 0 || hardware.waitCalls != 0 || hardware.cancels != 0 {
+		t.Fatalf(
+			"queued helper lifecycle = starts:%d ready:%d waits:%d cancels:%d",
+			hardware.calls,
+			hardware.readyCalls,
+			hardware.waitCalls,
+			hardware.cancels,
+		)
+	}
+	if invalidations != 0 {
+		t.Fatalf("queued cancellation invalidated %d retained sessions", invalidations)
+	}
+	if events := lifecycle.types(); !signingEventTypesEqual(events, eventsBeforeQueuedRequest) {
+		t.Fatalf("queued cancellation published UI lifecycle: before=%v after=%v", eventsBeforeQueuedRequest, events)
 	}
 	close(blocking)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProbeCancellationDoesNotInvalidateAnotherActiveHardwareRequest(t *testing.T) {
+	cfg, request := testProfile(t, false)
+	readyEntered := make(chan struct{})
+	readyGate := make(chan struct{})
+	hardware := &fakeRunner{
+		key:          bytes.Repeat([]byte{0x42}, 16),
+		readyEntered: readyEntered,
+		readyGate:    readyGate,
+	}
+	probeEntered := make(chan struct{})
+	var probeMu sync.Mutex
+	probeCalls := 0
+	probe := probeFunc(func(ctx context.Context, _ agehardware.Target) (agehardware.ProbeResult, error) {
+		probeMu.Lock()
+		probeCalls++
+		call := probeCalls
+		probeMu.Unlock()
+		if call == 1 {
+			return agehardware.ProbeResult{State: agehardware.Connected}, nil
+		}
+		if call == 2 {
+			close(probeEntered)
+			<-ctx.Done()
+			return agehardware.ProbeResult{State: agehardware.Unavailable}, ctx.Err()
+		}
+		return agehardware.ProbeResult{State: agehardware.Unavailable}, agehardware.ErrProbeUnavailable
+	})
+	var invalidationMu sync.Mutex
+	invalidations := 0
+	service := New(Options{
+		Config:      cfg,
+		Probe:       probe,
+		Coordinator: signing.New(nil, nil, 5*time.Second),
+		NewRunner:   pathFactory(hardware, &fakeRunner{}),
+		HardwareInvalidator: func() error {
+			invalidationMu.Lock()
+			invalidations++
+			invalidationMu.Unlock()
+			hardware.CancelCurrent()
+			return nil
+		},
+		ProbeTimeout:  time.Second,
+		ProbeInterval: time.Millisecond,
+	})
+	type unwrapResult struct {
+		key   []byte
+		class ageipc.ErrorClass
+	}
+	activeResult := make(chan unwrapResult, 1)
+	go func() {
+		key, class := service.Unwrap(context.Background(), signing.Requester{}, request)
+		activeResult <- unwrapResult{key: key, class: class}
+	}()
+	<-readyEntered
+
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	queuedResult := make(chan ageipc.ErrorClass, 1)
+	go func() {
+		key, class := service.Unwrap(queuedCtx, signing.Requester{}, request)
+		clear(key)
+		queuedResult <- class
+	}()
+	<-probeEntered
+	cancelQueued()
+	if class := <-queuedResult; class != ageipc.ClassCanceled {
+		t.Fatalf("queued class = %q, want %q", class, ageipc.ClassCanceled)
+	}
+	close(readyGate)
+	active := <-activeResult
+	defer clear(active.key)
+
+	invalidationMu.Lock()
+	gotInvalidations := invalidations
+	invalidationMu.Unlock()
+	hardware.mu.Lock()
+	starts, waits, cancels := hardware.calls, hardware.waitCalls, hardware.cancels
+	hardware.mu.Unlock()
+	if active.class != "" || !bytes.Equal(active.key, hardware.key) {
+		t.Fatalf("active Unwrap = %x, %q", active.key, active.class)
+	}
+	if gotInvalidations != 0 || starts != 1 || waits != 1 || cancels != 0 {
+		t.Fatalf("active lifecycle = invalidations:%d starts:%d waits:%d cancels:%d", gotInvalidations, starts, waits, cancels)
+	}
+}
+
+func TestRecoveryCreatesFreshRunnerForEveryRequest(t *testing.T) {
+	cfg, request := testProfile(t, true)
+	probe := &fakeProbe{states: []agehardware.ProbeState{
+		agehardware.NotDetected,
+		agehardware.NotDetected,
+		agehardware.NotDetected,
+		agehardware.NotDetected,
+	}}
+	var runners []*fakeRunner
+	service := testService(cfg, probe, func(path ageprofile.Path) Runner {
+		if path != ageprofile.PathRecovery {
+			t.Fatalf("runner path = %q, want recovery", path)
+		}
+		runner := &fakeRunner{key: bytes.Repeat([]byte{0x24}, 16)}
+		runners = append(runners, runner)
+		return runner
+	})
+
+	for range 2 {
+		fileKey, class := service.Unwrap(context.Background(), signing.Requester{}, request)
+		clear(fileKey)
+		if class != "" {
+			t.Fatalf("Unwrap class = %q", class)
+		}
+	}
+	if len(runners) != 2 || runners[0] == runners[1] || runners[0].calls != 1 || runners[1].calls != 1 {
+		t.Fatalf("recovery runners = %#v, want two distinct one-shot runners", runners)
 	}
 }
 
@@ -463,6 +929,12 @@ type fakeProbe struct {
 	calls  int
 }
 
+type probeFunc func(context.Context, agehardware.Target) (agehardware.ProbeResult, error)
+
+func (f probeFunc) Probe(ctx context.Context, target agehardware.Target) (agehardware.ProbeResult, error) {
+	return f(ctx, target)
+}
+
 func (p *fakeProbe) Probe(context.Context, agehardware.Target) (agehardware.ProbeResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -492,6 +964,8 @@ type fakeRunner struct {
 	blockUntilCancel      bool
 	readyEntered          chan struct{}
 	readyGate             <-chan struct{}
+	waitEntered           chan struct{}
+	waitGate              <-chan struct{}
 	canceled              chan struct{}
 	ctx                   context.Context
 }
@@ -559,9 +1033,21 @@ func (r *fakeRunner) Wait() ([]byte, ageipc.ErrorClass) {
 	canceled := r.canceled
 	ctx := r.ctx
 	block := r.blockUntilCancel
+	entered := r.waitEntered
+	gate := r.waitGate
 	key := append([]byte(nil), r.key...)
 	class := r.class
 	r.mu.Unlock()
+	if entered != nil {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+	}
+	if gate != nil {
+		<-gate
+	}
 	if block {
 		select {
 		case <-ctx.Done():

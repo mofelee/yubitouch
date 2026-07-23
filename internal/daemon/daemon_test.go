@@ -166,6 +166,65 @@ func TestMapHelperErrorUsesOnlyPredefinedIPCClasses(t *testing.T) {
 	}
 }
 
+func TestAgeRunnerFactorySharesHardwareManagerAndKeepsRecoveryOneShot(t *testing.T) {
+	manager := agehelper.NewHardwareManager("/bin/false", "/tmp/yubitouch-test-config", time.Second)
+	t.Cleanup(func() { _ = manager.Close() })
+	factory := newAgeRunnerFactory(
+		manager,
+		"/bin/false",
+		"/tmp/yubitouch-test-config",
+		time.Second,
+	)
+
+	hardwareFirst, ok := factory(ageprofile.PathHardware).(*ageRunner)
+	if !ok {
+		t.Fatal("hardware factory did not return an age runner")
+	}
+	hardwareSecond, ok := factory(ageprofile.PathHardware).(*ageRunner)
+	if !ok {
+		t.Fatal("second hardware factory call did not return an age runner")
+	}
+	if hardwareFirst == hardwareSecond ||
+		hardwareFirst.hardwareManager != manager ||
+		hardwareSecond.hardwareManager != manager ||
+		hardwareFirst.invalidateHardware == nil || hardwareSecond.invalidateHardware == nil ||
+		hardwareFirst.runner != nil || hardwareSecond.runner != nil {
+		t.Fatal("hardware runners did not bind distinct requests to the shared manager")
+	}
+
+	recoveryFirst, ok := factory(ageprofile.PathRecovery).(*ageRunner)
+	if !ok {
+		t.Fatal("recovery factory did not return an age runner")
+	}
+	recoverySecond, ok := factory(ageprofile.PathRecovery).(*ageRunner)
+	if !ok {
+		t.Fatal("second recovery factory call did not return an age runner")
+	}
+	if recoveryFirst == recoverySecond || recoveryFirst.runner == nil || recoverySecond.runner == nil ||
+		recoveryFirst.runner == recoverySecond.runner ||
+		recoveryFirst.hardwareManager != nil || recoverySecond.hardwareManager != nil {
+		t.Fatal("recovery runners reused a helper runner")
+	}
+	if runner := factory(ageprofile.Path(0xff)); runner != nil {
+		t.Fatalf("unexpected path runner = %#v, want nil", runner)
+	}
+}
+
+func TestHardwareAgeRunnerCancellationAlwaysInvalidatesRetainedSession(t *testing.T) {
+	invalidations := 0
+	runner := &ageRunner{
+		mode: agehelper.ModeHardware,
+		invalidateHardware: func() error {
+			invalidations++
+			return nil
+		},
+	}
+	runner.CancelCurrent()
+	if invalidations != 1 {
+		t.Fatalf("hardware cancellation invalidated %d sessions, want 1", invalidations)
+	}
+}
+
 type daemonHelper struct {
 	cmd     *exec.Cmd
 	output  bytes.Buffer
