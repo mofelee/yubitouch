@@ -308,37 +308,72 @@ func saveUnlocked(path string, cfg Config) error {
 }
 
 func withConfigLock(path string, fn func() error) error {
+	release, err := acquireConfigLock(path, unix.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+// AcquireSharedLock holds the configuration's cross-process read lock until
+// the returned release function is called. Release is safe to call more than
+// once. Supported configuration writers use the matching exclusive lock.
+func AcquireSharedLock(path string) (func(), error) {
+	return acquireConfigLock(path, unix.LOCK_SH)
+}
+
+func acquireConfigLock(path string, operation int) (func(), error) {
 	configProcessLock.Lock()
-	defer configProcessLock.Unlock()
+	processLocked := true
+	defer func() {
+		if processLocked {
+			configProcessLock.Unlock()
+		}
+	}()
 
 	if err := EnsurePrivateDir(filepath.Dir(path)); err != nil {
-		return err
+		return nil, err
 	}
 	lockPath := path + ".lock"
 	fd, err := unix.Open(lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
 	if err != nil {
-		return fmt.Errorf("open configuration lock: %w", err)
+		return nil, fmt.Errorf("open configuration lock: %w", err)
 	}
-	defer unix.Close(fd)
+	closeFD := true
+	defer func() {
+		if closeFD {
+			unix.Close(fd)
+		}
+	}()
 
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
-		return fmt.Errorf("inspect configuration lock: %w", err)
+		return nil, fmt.Errorf("inspect configuration lock: %w", err)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG || int(stat.Uid) != os.Getuid() || stat.Mode&0o777 != 0o600 {
-		return errors.New("configuration lock must be a 0600 regular file owned by the current user")
+		return nil, errors.New("configuration lock must be a 0600 regular file owned by the current user")
 	}
 	for {
-		err = unix.Flock(fd, unix.LOCK_EX)
+		err = unix.Flock(fd, operation)
 		if !errors.Is(err, unix.EINTR) {
 			break
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("lock configuration: %w", err)
+		return nil, fmt.Errorf("lock configuration: %w", err)
 	}
-	defer unix.Flock(fd, unix.LOCK_UN)
-	return fn()
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			_ = unix.Flock(fd, unix.LOCK_UN)
+			_ = unix.Close(fd)
+			configProcessLock.Unlock()
+		})
+	}
+	processLocked = false
+	closeFD = false
+	return release, nil
 }
 
 func EnsurePrivateDir(path string) error {

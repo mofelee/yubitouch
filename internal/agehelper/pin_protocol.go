@@ -7,7 +7,7 @@ import (
 
 const (
 	pinResolverProtocolMagic   uint32 = 0x5954504e // YTPN
-	pinResolverProtocolVersion byte   = 1
+	pinResolverProtocolVersion byte   = 2
 	pinResolverRequestType     byte   = 1
 	pinResolverResponseType    byte   = 2
 
@@ -23,7 +23,8 @@ const (
 	pinResolverTypeOffset      = pinResolverVersionOffset + 1
 	pinResolverSessionIDOffset = pinResolverTypeOffset + 1
 	pinResolverRequestIDOffset = pinResolverSessionIDOffset + identifierSize
-	pinResolverRequestSize     = pinResolverRequestIDOffset + identifierSize
+	pinResolverBindingOffset   = pinResolverRequestIDOffset + identifierSize
+	pinResolverRequestSize     = pinResolverBindingOffset + configSnapshotBindingSize
 
 	pinResolverStatusOffset       = pinResolverRequestSize
 	pinResolverLengthOffset       = pinResolverStatusOffset + 1
@@ -39,12 +40,16 @@ const (
 	pinResolverErrorHelper        byte = 5
 )
 
-func marshalPINResolverRequest(sessionID sessionIdentifier, requestID requestIdentifier) ([]byte, error) {
-	if !identifierIsValid(sessionID[:]) || !identifierIsValid(requestID[:]) {
+func marshalPINResolverRequest(
+	sessionID sessionIdentifier,
+	requestID requestIdentifier,
+	binding configSnapshotBinding,
+) ([]byte, error) {
+	if !identifierIsValid(sessionID[:]) || !identifierIsValid(requestID[:]) || !validConfigSnapshotBinding(binding) {
 		return nil, classError(ErrorInvalidRequest)
 	}
 	payload := make([]byte, pinResolverRequestSize)
-	putPINResolverHeader(payload, pinResolverRequestType, sessionID, requestID)
+	putPINResolverHeader(payload, pinResolverRequestType, sessionID, requestID, binding)
 	return payload, nil
 }
 
@@ -52,23 +57,29 @@ func unmarshalPINResolverRequest(
 	payload []byte,
 	expectedSessionID sessionIdentifier,
 	expectedRequestID requestIdentifier,
-) error {
+) (configSnapshotBinding, error) {
 	if len(payload) != pinResolverRequestSize ||
-		!validPINResolverHeader(payload, pinResolverRequestType, expectedSessionID, expectedRequestID) {
-		return classError(ErrorInvalidRequest)
+		!validPINResolverBaseHeader(payload, pinResolverRequestType, expectedSessionID, expectedRequestID) {
+		return configSnapshotBinding{}, classError(ErrorInvalidRequest)
 	}
-	return nil
+	var binding configSnapshotBinding
+	copy(binding[:], payload[pinResolverBindingOffset:pinResolverRequestSize])
+	if !validConfigSnapshotBinding(binding) {
+		return configSnapshotBinding{}, classError(ErrorInvalidRequest)
+	}
+	return binding, nil
 }
 
 func writePINResolverRequestFrame(
 	writer io.Writer,
 	sessionID sessionIdentifier,
 	requestID requestIdentifier,
+	binding configSnapshotBinding,
 ) error {
 	if writer == nil {
 		return classError(ErrorHelper)
 	}
-	payload, err := marshalPINResolverRequest(sessionID, requestID)
+	payload, err := marshalPINResolverRequest(sessionID, requestID, binding)
 	if err != nil {
 		return err
 	}
@@ -83,17 +94,17 @@ func readPINResolverRequestFrame(
 	reader io.Reader,
 	expectedSessionID sessionIdentifier,
 	expectedRequestID requestIdentifier,
-) error {
+) (configSnapshotBinding, error) {
 	if reader == nil {
-		return classError(ErrorInvalidRequest)
+		return configSnapshotBinding{}, classError(ErrorInvalidRequest)
 	}
 	payload, err := readFrame(reader, maxPINResolverFrame)
 	if err != nil {
-		return classError(ErrorInvalidRequest)
+		return configSnapshotBinding{}, classError(ErrorInvalidRequest)
 	}
 	defer clear(payload)
 	if ensureEOF(reader) != nil {
-		return classError(ErrorInvalidRequest)
+		return configSnapshotBinding{}, classError(ErrorInvalidRequest)
 	}
 	return unmarshalPINResolverRequest(payload, expectedSessionID, expectedRequestID)
 }
@@ -101,10 +112,11 @@ func readPINResolverRequestFrame(
 func marshalPINResolverResponse(
 	sessionID sessionIdentifier,
 	requestID requestIdentifier,
+	binding configSnapshotBinding,
 	pin []byte,
 	class ErrorClass,
 ) ([]byte, error) {
-	if !identifierIsValid(sessionID[:]) || !identifierIsValid(requestID[:]) {
+	if !identifierIsValid(sessionID[:]) || !identifierIsValid(requestID[:]) || !validConfigSnapshotBinding(binding) {
 		return nil, classError(ErrorHelper)
 	}
 	status := pinResolverStatusSuccess
@@ -128,7 +140,7 @@ func marshalPINResolverResponse(
 	}
 
 	payload := make([]byte, pinResolverResponseHeaderSize+dataLength)
-	putPINResolverHeader(payload, pinResolverResponseType, sessionID, requestID)
+	putPINResolverHeader(payload, pinResolverResponseType, sessionID, requestID, binding)
 	payload[pinResolverStatusOffset] = status
 	binary.BigEndian.PutUint16(payload[pinResolverLengthOffset:pinResolverResponseHeaderSize], uint16(dataLength))
 	if status == pinResolverStatusSuccess {
@@ -145,10 +157,11 @@ func unmarshalPINResolverResponse(
 	payload []byte,
 	expectedSessionID sessionIdentifier,
 	expectedRequestID requestIdentifier,
+	expectedBinding configSnapshotBinding,
 ) ([]byte, error) {
 	defer clear(payload)
 	if len(payload) < pinResolverResponseHeaderSize || len(payload) > maxPINResolverFrame ||
-		!validPINResolverHeader(payload, pinResolverResponseType, expectedSessionID, expectedRequestID) {
+		!validPINResolverHeader(payload, pinResolverResponseType, expectedSessionID, expectedRequestID, expectedBinding) {
 		return nil, classError(ErrorHelper)
 	}
 	declaredLength := int(binary.BigEndian.Uint16(payload[pinResolverLengthOffset:pinResolverResponseHeaderSize]))
@@ -181,13 +194,14 @@ func writePINResolverResponseFrame(
 	writer io.Writer,
 	sessionID sessionIdentifier,
 	requestID requestIdentifier,
+	binding configSnapshotBinding,
 	pin []byte,
 	class ErrorClass,
 ) error {
 	if writer == nil {
 		return classError(ErrorHelper)
 	}
-	payload, err := marshalPINResolverResponse(sessionID, requestID, pin, class)
+	payload, err := marshalPINResolverResponse(sessionID, requestID, binding, pin, class)
 	if err != nil {
 		return err
 	}
@@ -202,6 +216,7 @@ func readPINResolverResponseFrame(
 	reader io.Reader,
 	expectedSessionID sessionIdentifier,
 	expectedRequestID requestIdentifier,
+	expectedBinding configSnapshotBinding,
 ) ([]byte, error) {
 	if reader == nil {
 		return nil, classError(ErrorHelper)
@@ -214,7 +229,7 @@ func readPINResolverResponseFrame(
 		clear(payload)
 		return nil, classError(ErrorHelper)
 	}
-	return unmarshalPINResolverResponse(payload, expectedSessionID, expectedRequestID)
+	return unmarshalPINResolverResponse(payload, expectedSessionID, expectedRequestID, expectedBinding)
 }
 
 func putPINResolverHeader(
@@ -222,15 +237,33 @@ func putPINResolverHeader(
 	messageType byte,
 	sessionID sessionIdentifier,
 	requestID requestIdentifier,
+	binding configSnapshotBinding,
 ) {
 	binary.BigEndian.PutUint32(payload[pinResolverMagicOffset:pinResolverVersionOffset], pinResolverProtocolMagic)
 	payload[pinResolverVersionOffset] = pinResolverProtocolVersion
 	payload[pinResolverTypeOffset] = messageType
 	copy(payload[pinResolverSessionIDOffset:pinResolverRequestIDOffset], sessionID[:])
-	copy(payload[pinResolverRequestIDOffset:pinResolverRequestSize], requestID[:])
+	copy(payload[pinResolverRequestIDOffset:pinResolverBindingOffset], requestID[:])
+	copy(payload[pinResolverBindingOffset:pinResolverRequestSize], binding[:])
 }
 
 func validPINResolverHeader(
+	payload []byte,
+	messageType byte,
+	expectedSessionID sessionIdentifier,
+	expectedRequestID requestIdentifier,
+	expectedBinding configSnapshotBinding,
+) bool {
+	if !validConfigSnapshotBinding(expectedBinding) ||
+		!validPINResolverBaseHeader(payload, messageType, expectedSessionID, expectedRequestID) {
+		return false
+	}
+	var binding configSnapshotBinding
+	copy(binding[:], payload[pinResolverBindingOffset:pinResolverRequestSize])
+	return binding == expectedBinding
+}
+
+func validPINResolverBaseHeader(
 	payload []byte,
 	messageType byte,
 	expectedSessionID sessionIdentifier,
@@ -245,7 +278,7 @@ func validPINResolverHeader(
 	var sessionID sessionIdentifier
 	var requestID requestIdentifier
 	copy(sessionID[:], payload[pinResolverSessionIDOffset:pinResolverRequestIDOffset])
-	copy(requestID[:], payload[pinResolverRequestIDOffset:pinResolverRequestSize])
+	copy(requestID[:], payload[pinResolverRequestIDOffset:pinResolverBindingOffset])
 	return sessionID == expectedSessionID && requestID == expectedRequestID
 }
 

@@ -57,6 +57,14 @@ func RunInternalFromEnvironment(
 	getenv func(string) string,
 	home string,
 ) (handled bool, exitCode int) {
+	if getenv != nil {
+		switch getenv(internalModeEnvironment) {
+		case internalHardwareSessionMode:
+			return runHardwareSessionInternal(ctx, stdin, stdout, getenv, home, productionHardwareSessionHelperDependencies())
+		case internalPINResolverMode:
+			return runPINResolverInternal(ctx, stdin, stdout, getenv, home, productionPINResolverDependencies())
+		}
+	}
 	return runInternal(ctx, stdin, stdout, getenv, home, productionHelperDependencies())
 }
 

@@ -24,6 +24,18 @@ const parentAuthChildPrefix = "parent-auth-child-"
 const parentDeathLauncherEnvironment = "YUBITOUCH_TEST_AGE_PARENT_DEATH_LAUNCHER"
 
 func TestMain(m *testing.M) {
+	switch os.Getenv(internalModeEnvironment) {
+	case internalHardwareSessionMode:
+		configPath := os.Getenv("YUBITOUCH_CONFIG")
+		if strings.HasPrefix(filepath.Base(configPath), hardwareManagerChildPrefix) {
+			os.Exit(runHardwareManagerTestChild(configPath))
+		}
+	case internalPINResolverMode:
+		configPath := os.Getenv("YUBITOUCH_CONFIG")
+		if strings.HasPrefix(filepath.Base(configPath), pinResolverProcessChildPrefix) {
+			os.Exit(runPINResolverProcessTestChild(configPath))
+		}
+	}
 	if _, valid := parseMode(os.Getenv(internalModeEnvironment)); valid {
 		configPath := os.Getenv("YUBITOUCH_CONFIG")
 		if strings.HasPrefix(filepath.Base(configPath), parentAuthChildPrefix) {

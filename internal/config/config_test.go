@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -163,6 +164,158 @@ func TestSaveCreatesPrivateConfigurationLock(t *testing.T) {
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		t.Fatalf("configuration lock mode = %v, want regular 0600", info.Mode())
+	}
+}
+
+func TestSupportedConfigurationWritersWaitForSharedLock(t *testing.T) {
+	for _, writerName := range []string{"save", "configure", "cache age public key"} {
+		t.Run(writerName, func(t *testing.T) {
+			home, cfg := validAgeTestConfig(t)
+			// Keep this lock test independent from the 1Password SDK's comparatively
+			// expensive secret-reference validation under the race detector.
+			cfg.Age.Recovery = nil
+			cfg.OnePasswordAccount = ""
+			path := DefaultPath(home)
+			if err := Save(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+
+			var write func() error
+			switch writerName {
+			case "save":
+				write = func() error { return Save(path, cfg) }
+			case "configure":
+				write = func() error {
+					_, err := Configure(path, home, func(string) string { return "" })
+					return err
+				}
+			case "cache age public key":
+				encodedPublic := validAgePublicKey(t)
+				rawPublic, err := base64.RawURLEncoding.DecodeString(encodedPublic)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var publicKey ageprofile.PublicKey
+				copy(publicKey[:], rawPublic)
+				clear(rawPublic)
+				target := AgeTarget{Serial: cfg.Age.Serial, Slot: cfg.Age.Slot, Algorithm: cfg.Age.Algorithm}
+				write = func() error {
+					_, err := CacheAgePublicKey(path, home, target, publicKey)
+					return err
+				}
+			}
+
+			release, err := AcquireSharedLock(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				close(started)
+				done <- write()
+			}()
+			<-started
+			select {
+			case err := <-done:
+				t.Fatalf("%s completed while the shared lock was held: %v", writerName, err)
+			case <-time.After(75 * time.Millisecond):
+			}
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("%s failed after the shared lock was released: %v", writerName, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s remained blocked after the shared lock was released", writerName)
+			}
+		})
+	}
+}
+
+func TestConfigurationSharedLockBlocksWriterProcess(t *testing.T) {
+	const (
+		childModeEnvironment   = "YUBITOUCH_TEST_CONFIG_LOCK_CHILD"
+		childPathEnvironment   = "YUBITOUCH_TEST_CONFIG_LOCK_PATH"
+		childMarkerEnvironment = "YUBITOUCH_TEST_CONFIG_LOCK_MARKER"
+	)
+	if os.Getenv(childModeEnvironment) == "1" {
+		path := os.Getenv(childPathEnvironment)
+		marker := os.Getenv(childMarkerEnvironment)
+		if path == "" || marker == "" {
+			t.Fatal("configuration lock child environment is incomplete")
+		}
+		if err := os.WriteFile(marker, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := Save(path, Config{}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.json")
+	marker := filepath.Join(directory, "writer-ready")
+	release, err := AcquireSharedLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestConfigurationSharedLockBlocksWriterProcess$", "-test.v=false")
+	cmd.Env = append(os.Environ(),
+		childModeEnvironment+"=1",
+		childPathEnvironment+"="+path,
+		childMarkerEnvironment+"="+marker,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	finished := false
+	defer func() {
+		if !finished {
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer process did not reach Save")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		finished = true
+		t.Fatalf("writer process completed while the shared lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-done:
+		finished = true
+		if err != nil {
+			t.Fatalf("writer process failed after shared lock release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer process remained blocked after shared lock release")
 	}
 }
 

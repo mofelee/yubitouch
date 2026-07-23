@@ -10,7 +10,8 @@ import (
 
 func TestPINResolverRequestBinaryRoundTripAndBinding(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
-	payload, err := marshalPINResolverRequest(sessionID, requestID)
+	binding := fixedConfigSnapshotBinding()
+	payload, err := marshalPINResolverRequest(sessionID, requestID, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,8 +19,8 @@ func TestPINResolverRequestBinaryRoundTripAndBinding(t *testing.T) {
 	if len(payload) != pinResolverRequestSize || binary.BigEndian.Uint32(payload[:4]) != pinResolverProtocolMagic {
 		t.Fatalf("request payload length/magic = %d/%x", len(payload), payload[:4])
 	}
-	if err := unmarshalPINResolverRequest(payload, sessionID, requestID); err != nil {
-		t.Fatal(err)
+	if got, err := unmarshalPINResolverRequest(payload, sessionID, requestID); err != nil || got != binding {
+		t.Fatalf("binding=%x err=%v", got, err)
 	}
 
 	wrongSessionID, wrongRequestID := differentSessionBinding()
@@ -38,7 +39,7 @@ func TestPINResolverRequestBinaryRoundTripAndBinding(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer clear(test.payload)
-			if err := unmarshalPINResolverRequest(test.payload, test.sessionID, test.requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+			if _, err := unmarshalPINResolverRequest(test.payload, test.sessionID, test.requestID); ErrorClassOf(err) != ErrorInvalidRequest {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
 			}
 		})
@@ -54,18 +55,29 @@ func TestPINResolverRequestBinaryRoundTripAndBinding(t *testing.T) {
 			mutation := append([]byte(nil), payload...)
 			defer clear(mutation)
 			mutation[offset] ^= 0xff
-			if err := unmarshalPINResolverRequest(mutation, sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+			if _, err := unmarshalPINResolverRequest(mutation, sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
 			}
 		})
 	}
-	if _, err := marshalPINResolverRequest(sessionIdentifier{}, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+	zeroBinding := append([]byte(nil), payload...)
+	clear(zeroBinding[pinResolverBindingOffset:pinResolverRequestSize])
+	if _, err := unmarshalPINResolverRequest(zeroBinding, sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+		clear(zeroBinding)
+		t.Fatal("zero snapshot binding was accepted")
+	}
+	clear(zeroBinding)
+	if _, err := marshalPINResolverRequest(sessionIdentifier{}, requestID, binding); ErrorClassOf(err) != ErrorInvalidRequest {
 		t.Fatal("zero session identifier was encoded")
+	}
+	if _, err := marshalPINResolverRequest(sessionID, requestID, configSnapshotBinding{}); ErrorClassOf(err) != ErrorInvalidRequest {
+		t.Fatal("zero snapshot binding was encoded")
 	}
 }
 
 func TestPINResolverSuccessResponseIsBinaryMutableAndConsumed(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
+	binding := fixedConfigSnapshotBinding()
 	for name, pin := range map[string][]byte{
 		"one byte": {0},
 		"binary":   {0, 0xff, 0x80, '1', '\n', 0},
@@ -74,7 +86,7 @@ func TestPINResolverSuccessResponseIsBinaryMutableAndConsumed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			original := append([]byte(nil), pin...)
 			defer clear(original)
-			payload, err := marshalPINResolverResponse(sessionID, requestID, pin, "")
+			payload, err := marshalPINResolverResponse(sessionID, requestID, binding, pin, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -85,7 +97,7 @@ func TestPINResolverSuccessResponseIsBinaryMutableAndConsumed(t *testing.T) {
 				!bytes.Equal(payload[pinResolverResponseHeaderSize:], pin) {
 				t.Fatal("success response did not contain the exact binary PIN")
 			}
-			decoded, err := unmarshalPINResolverResponse(payload, sessionID, requestID)
+			decoded, err := unmarshalPINResolverResponse(payload, sessionID, requestID, binding)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -105,6 +117,7 @@ func TestPINResolverSuccessResponseIsBinaryMutableAndConsumed(t *testing.T) {
 
 func TestPINResolverFixedErrorResponses(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
+	binding := fixedConfigSnapshotBinding()
 	for _, want := range []ErrorClass{
 		ErrorConfiguration,
 		ErrorPINProvider,
@@ -113,14 +126,14 @@ func TestPINResolverFixedErrorResponses(t *testing.T) {
 		ErrorHelper,
 	} {
 		t.Run(string(want), func(t *testing.T) {
-			payload, err := marshalPINResolverResponse(sessionID, requestID, nil, want)
+			payload, err := marshalPINResolverResponse(sessionID, requestID, binding, nil, want)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if payload[pinResolverStatusOffset] != pinResolverStatusError || len(payload) != pinResolverResponseHeaderSize+1 {
 				t.Fatal("error response did not use the fixed binary status/code layout")
 			}
-			pin, err := unmarshalPINResolverResponse(payload, sessionID, requestID)
+			pin, err := unmarshalPINResolverResponse(payload, sessionID, requestID, binding)
 			ClearSecret(pin)
 			if ErrorClassOf(err) != want {
 				t.Fatalf("error class = %q, want %q", ErrorClassOf(err), want)
@@ -134,7 +147,10 @@ func TestPINResolverFixedErrorResponses(t *testing.T) {
 
 func TestPINResolverResponseRejectsInvalidLengthsStatusAndBindings(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
+	binding := fixedConfigSnapshotBinding()
 	wrongSessionID, wrongRequestID := differentSessionBinding()
+	wrongBinding := binding
+	wrongBinding[0] ^= 0xff
 
 	for name, test := range map[string]struct {
 		pin   []byte
@@ -147,24 +163,24 @@ func TestPINResolverResponseRejectsInvalidLengthsStatusAndBindings(t *testing.T)
 	} {
 		t.Run("marshal "+name, func(t *testing.T) {
 			defer clear(test.pin)
-			payload, err := marshalPINResolverResponse(sessionID, requestID, test.pin, test.class)
+			payload, err := marshalPINResolverResponse(sessionID, requestID, binding, test.pin, test.class)
 			clear(payload)
 			if ErrorClassOf(err) != ErrorHelper {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
 			}
 		})
 	}
-	if payload, err := marshalPINResolverResponse(sessionIdentifier{}, requestID, []byte{1}, ""); ErrorClassOf(err) != ErrorHelper {
+	if payload, err := marshalPINResolverResponse(sessionIdentifier{}, requestID, binding, []byte{1}, ""); ErrorClassOf(err) != ErrorHelper {
 		clear(payload)
 		t.Fatal("zero session identifier was encoded")
 	}
 
-	valid, err := marshalPINResolverResponse(sessionID, requestID, []byte{0, 1, 2, 3}, "")
+	valid, err := marshalPINResolverResponse(sessionID, requestID, binding, []byte{0, 1, 2, 3}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(valid)
-	errorPayload, err := marshalPINResolverResponse(sessionID, requestID, nil, ErrorPINProvider)
+	errorPayload, err := marshalPINResolverResponse(sessionID, requestID, binding, nil, ErrorPINProvider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,40 +190,43 @@ func TestPINResolverResponseRejectsInvalidLengthsStatusAndBindings(t *testing.T)
 		payload   []byte
 		sessionID sessionIdentifier
 		requestID requestIdentifier
+		binding   configSnapshotBinding
 	}
 	tests := map[string]invalidResponse{
-		"empty":             {nil, sessionID, requestID},
-		"short header":      {append([]byte(nil), valid[:pinResolverResponseHeaderSize-1]...), sessionID, requestID},
-		"truncated data":    {append([]byte(nil), valid[:len(valid)-1]...), sessionID, requestID},
-		"trailing data":     {append(append([]byte(nil), valid...), 0), sessionID, requestID},
-		"wrong session":     {append([]byte(nil), valid...), wrongSessionID, requestID},
-		"wrong request":     {append([]byte(nil), valid...), sessionID, wrongRequestID},
-		"zero session":      {append([]byte(nil), valid...), sessionIdentifier{}, requestID},
-		"zero request":      {append([]byte(nil), valid...), sessionID, requestIdentifier{}},
-		"request as result": {mustPINRequestPayload(t, sessionID, requestID), sessionID, requestID},
+		"empty":             {nil, sessionID, requestID, binding},
+		"short header":      {append([]byte(nil), valid[:pinResolverResponseHeaderSize-1]...), sessionID, requestID, binding},
+		"truncated data":    {append([]byte(nil), valid[:len(valid)-1]...), sessionID, requestID, binding},
+		"trailing data":     {append(append([]byte(nil), valid...), 0), sessionID, requestID, binding},
+		"wrong session":     {append([]byte(nil), valid...), wrongSessionID, requestID, binding},
+		"wrong request":     {append([]byte(nil), valid...), sessionID, wrongRequestID, binding},
+		"wrong binding":     {append([]byte(nil), valid...), sessionID, requestID, wrongBinding},
+		"zero session":      {append([]byte(nil), valid...), sessionIdentifier{}, requestID, binding},
+		"zero request":      {append([]byte(nil), valid...), sessionID, requestIdentifier{}, binding},
+		"zero binding":      {append([]byte(nil), valid...), sessionID, requestID, configSnapshotBinding{}},
+		"request as result": {mustPINRequestPayload(t, sessionID, requestID, binding), sessionID, requestID, binding},
 	}
 
 	wrongStatus := append([]byte(nil), valid...)
 	wrongStatus[pinResolverStatusOffset] = 0x7f
-	tests["unknown status"] = invalidResponse{wrongStatus, sessionID, requestID}
+	tests["unknown status"] = invalidResponse{wrongStatus, sessionID, requestID, binding}
 
 	zeroLength := append([]byte(nil), valid[:pinResolverResponseHeaderSize]...)
 	binary.BigEndian.PutUint16(zeroLength[pinResolverLengthOffset:pinResolverResponseHeaderSize], 0)
-	tests["zero success length"] = invalidResponse{zeroLength, sessionID, requestID}
+	tests["zero success length"] = invalidResponse{zeroLength, sessionID, requestID, binding}
 
 	unknownCode := append([]byte(nil), errorPayload...)
 	unknownCode[pinResolverResponseHeaderSize] = 0xff
-	tests["unknown error code"] = invalidResponse{unknownCode, sessionID, requestID}
+	tests["unknown error code"] = invalidResponse{unknownCode, sessionID, requestID, binding}
 
 	errorLength := append(append([]byte(nil), errorPayload...), 0)
 	binary.BigEndian.PutUint16(errorLength[pinResolverLengthOffset:pinResolverResponseHeaderSize], 2)
-	tests["error length two"] = invalidResponse{errorLength, sessionID, requestID}
+	tests["error length two"] = invalidResponse{errorLength, sessionID, requestID, binding}
 
 	tooLong := make([]byte, pinResolverResponseHeaderSize+maxPINLength+1)
-	putPINResolverHeader(tooLong, pinResolverResponseType, sessionID, requestID)
+	putPINResolverHeader(tooLong, pinResolverResponseType, sessionID, requestID, binding)
 	tooLong[pinResolverStatusOffset] = pinResolverStatusSuccess
 	binary.BigEndian.PutUint16(tooLong[pinResolverLengthOffset:pinResolverResponseHeaderSize], maxPINLength+1)
-	tests["declared oversize"] = invalidResponse{tooLong, sessionID, requestID}
+	tests["declared oversize"] = invalidResponse{tooLong, sessionID, requestID, binding}
 
 	for name, offset := range map[string]int{
 		"magic":   pinResolverMagicOffset,
@@ -218,12 +237,12 @@ func TestPINResolverResponseRejectsInvalidLengthsStatusAndBindings(t *testing.T)
 	} {
 		mutation := append([]byte(nil), valid...)
 		mutation[offset] ^= 0xff
-		tests["corrupt "+name] = invalidResponse{mutation, sessionID, requestID}
+		tests["corrupt "+name] = invalidResponse{mutation, sessionID, requestID, binding}
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			pin, err := unmarshalPINResolverResponse(test.payload, test.sessionID, test.requestID)
+			pin, err := unmarshalPINResolverResponse(test.payload, test.sessionID, test.requestID, test.binding)
 			ClearSecret(pin)
 			if ErrorClassOf(err) != ErrorHelper {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
@@ -237,19 +256,20 @@ func TestPINResolverResponseRejectsInvalidLengthsStatusAndBindings(t *testing.T)
 
 func TestPINResolverFramedIORequiresExactlyOneFrameAndEOF(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
+	binding := fixedConfigSnapshotBinding()
 	pin := []byte{0, 1, 2, 0xff, '1', '2'}
 	originalPIN := append([]byte(nil), pin...)
 	defer clear(pin)
 	defer clear(originalPIN)
 
 	var requestStream bytes.Buffer
-	if err := writePINResolverRequestFrame(&requestStream, sessionID, requestID); err != nil {
+	if err := writePINResolverRequestFrame(&requestStream, sessionID, requestID, binding); err != nil {
 		t.Fatal(err)
 	}
 	requestBytes := append([]byte(nil), requestStream.Bytes()...)
 	defer clear(requestBytes)
-	if err := readPINResolverRequestFrame(bytes.NewReader(requestBytes), sessionID, requestID); err != nil {
-		t.Fatal(err)
+	if got, err := readPINResolverRequestFrame(bytes.NewReader(requestBytes), sessionID, requestID); err != nil || got != binding {
+		t.Fatalf("binding=%x err=%v", got, err)
 	}
 	for name, stream := range map[string][]byte{
 		"trailing":  append(append([]byte(nil), requestBytes...), 0),
@@ -258,14 +278,14 @@ func TestPINResolverFramedIORequiresExactlyOneFrameAndEOF(t *testing.T) {
 	} {
 		t.Run("request "+name, func(t *testing.T) {
 			defer clear(stream)
-			if err := readPINResolverRequestFrame(bytes.NewReader(stream), sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+			if _, err := readPINResolverRequestFrame(bytes.NewReader(stream), sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
 			}
 		})
 	}
 
 	var responseStream bytes.Buffer
-	if err := writePINResolverResponseFrame(&responseStream, sessionID, requestID, pin, ""); err != nil {
+	if err := writePINResolverResponseFrame(&responseStream, sessionID, requestID, binding, pin, ""); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(pin, originalPIN) {
@@ -273,7 +293,7 @@ func TestPINResolverFramedIORequiresExactlyOneFrameAndEOF(t *testing.T) {
 	}
 	responseBytes := append([]byte(nil), responseStream.Bytes()...)
 	defer clear(responseBytes)
-	decoded, err := readPINResolverResponseFrame(bytes.NewReader(responseBytes), sessionID, requestID)
+	decoded, err := readPINResolverResponseFrame(bytes.NewReader(responseBytes), sessionID, requestID, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +309,7 @@ func TestPINResolverFramedIORequiresExactlyOneFrameAndEOF(t *testing.T) {
 	} {
 		t.Run("response "+name, func(t *testing.T) {
 			defer clear(stream)
-			decoded, err := readPINResolverResponseFrame(bytes.NewReader(stream), sessionID, requestID)
+			decoded, err := readPINResolverResponseFrame(bytes.NewReader(stream), sessionID, requestID, binding)
 			ClearSecret(decoded)
 			if ErrorClassOf(err) != ErrorHelper {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
@@ -301,39 +321,52 @@ func TestPINResolverFramedIORequiresExactlyOneFrameAndEOF(t *testing.T) {
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], maxPINResolverFrame+1)
 	oversized.Write(header[:])
-	if decoded, err := readPINResolverResponseFrame(&oversized, sessionID, requestID); ErrorClassOf(err) != ErrorHelper {
+	if decoded, err := readPINResolverResponseFrame(&oversized, sessionID, requestID, binding); ErrorClassOf(err) != ErrorHelper {
 		ClearSecret(decoded)
 		t.Fatalf("oversized error class = %q", ErrorClassOf(err))
 	}
 
-	if err := writePINResolverRequestFrame(nil, sessionID, requestID); ErrorClassOf(err) != ErrorHelper {
+	if err := writePINResolverRequestFrame(nil, sessionID, requestID, binding); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("nil request writer was accepted")
 	}
-	if err := readPINResolverRequestFrame(nil, sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
+	if _, err := readPINResolverRequestFrame(nil, sessionID, requestID); ErrorClassOf(err) != ErrorInvalidRequest {
 		t.Fatal("nil request reader was accepted")
 	}
-	if err := writePINResolverResponseFrame(nil, sessionID, requestID, pin, ""); ErrorClassOf(err) != ErrorHelper {
+	if err := writePINResolverResponseFrame(nil, sessionID, requestID, binding, pin, ""); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("nil response writer was accepted")
 	}
-	if decoded, err := readPINResolverResponseFrame(nil, sessionID, requestID); ErrorClassOf(err) != ErrorHelper {
+	if decoded, err := readPINResolverResponseFrame(nil, sessionID, requestID, binding); ErrorClassOf(err) != ErrorHelper {
 		ClearSecret(decoded)
 		t.Fatal("nil response reader was accepted")
 	}
-	if err := writePINResolverResponseFrame(noProgressPINWriter{}, sessionID, requestID, pin, ""); ErrorClassOf(err) != ErrorHelper {
+	if err := writePINResolverResponseFrame(noProgressPINWriter{}, sessionID, requestID, binding, pin, ""); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("writer making no progress was accepted")
 	}
-	if err := writePINResolverResponseFrame(failingPINWriter{}, sessionID, requestID, pin, ""); ErrorClassOf(err) != ErrorHelper {
+	if err := writePINResolverResponseFrame(failingPINWriter{}, sessionID, requestID, binding, pin, ""); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("failing writer was accepted")
 	}
 }
 
-func mustPINRequestPayload(t *testing.T, sessionID sessionIdentifier, requestID requestIdentifier) []byte {
+func mustPINRequestPayload(
+	t *testing.T,
+	sessionID sessionIdentifier,
+	requestID requestIdentifier,
+	binding configSnapshotBinding,
+) []byte {
 	t.Helper()
-	payload, err := marshalPINResolverRequest(sessionID, requestID)
+	payload, err := marshalPINResolverRequest(sessionID, requestID, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return payload
+}
+
+func fixedConfigSnapshotBinding() configSnapshotBinding {
+	var binding configSnapshotBinding
+	for index := range binding {
+		binding[index] = byte(index + 65)
+	}
+	return binding
 }
 
 func allBytesZero(value []byte) bool {

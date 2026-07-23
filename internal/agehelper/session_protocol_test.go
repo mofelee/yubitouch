@@ -64,11 +64,15 @@ func TestSessionIdentifiersAreRandomCanonicalLowercaseHex(t *testing.T) {
 	if _, err := json.Marshal(requestIdentifier{}); err == nil {
 		t.Fatal("zero request identifier was encoded")
 	}
+	if _, err := json.Marshal(continuationIdentifier{}); err == nil {
+		t.Fatal("zero continuation identifier was encoded")
+	}
 }
 
 func TestSessionProtocolLegalRoundTrip(t *testing.T) {
 	fixture := newHelperFixture(t)
 	sessionID, requestID := fixedSessionBinding()
+	continuationID := fixedContinuationBinding()
 
 	requestPayload, err := marshalSessionRequest(sessionID, requestID, Request{Envelope: fixture.hardwareEnvelope})
 	if err != nil {
@@ -98,21 +102,21 @@ func TestSessionProtocolLegalRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	continued, err := marshalSessionContinue(sessionID, requestID)
+	continued, err := marshalSessionContinue(sessionID, requestID, continuationID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(continued)
-	if err := unmarshalSessionContinue(continued, sessionID, requestID); err != nil {
+	if got, err := unmarshalSessionContinue(continued, sessionID, requestID); err != nil || got != continuationID {
 		t.Fatal(err)
 	}
 
-	result, err := marshalSessionResult(sessionID, requestID, fixture.fileKey, "")
+	result, err := marshalSessionResult(sessionID, requestID, continuationID, fixture.fileKey, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(result)
-	fileKey, err := unmarshalSessionResult(result, sessionID, requestID)
+	fileKey, err := unmarshalSessionResult(result, sessionID, requestID, continuationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,19 +125,33 @@ func TestSessionProtocolLegalRoundTrip(t *testing.T) {
 		t.Fatal("session result changed the file key")
 	}
 
-	errorResult, err := marshalSessionResult(sessionID, requestID, nil, ErrorHardware)
+	errorResult, err := marshalSessionResult(sessionID, requestID, continuationID, nil, ErrorHardware)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(errorResult)
-	if _, err := unmarshalSessionResult(errorResult, sessionID, requestID); ErrorClassOf(err) != ErrorHardware {
+	if _, err := unmarshalSessionResult(errorResult, sessionID, requestID, continuationID); ErrorClassOf(err) != ErrorHardware {
 		t.Fatalf("error result class = %q", ErrorClassOf(err))
+	}
+	wrongContinuationID := continuationID
+	wrongContinuationID[0] ^= 0xff
+	if _, err := unmarshalSessionResult(result, sessionID, requestID, wrongContinuationID); ErrorClassOf(err) != ErrorHelper {
+		t.Fatal("result accepted a continuation binding not disclosed by continue")
+	}
+	earlyResult, err := marshalSessionEarlyResult(sessionID, requestID, ErrorPINProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(earlyResult)
+	if err := unmarshalSessionEarlyResult(earlyResult, sessionID, requestID); ErrorClassOf(err) != ErrorPINProvider {
+		t.Fatalf("early result class = %q", ErrorClassOf(err))
 	}
 }
 
 func TestSessionProtocolParsersRejectWrongTypesAndBindings(t *testing.T) {
 	fixture := newHelperFixture(t)
 	sessionID, requestID := fixedSessionBinding()
+	continuationID := fixedContinuationBinding()
 	wrongSessionID, wrongRequestID := differentSessionBinding()
 
 	payloads := make(map[string][]byte)
@@ -150,11 +168,11 @@ func TestSessionProtocolParsersRejectWrongTypesAndBindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payloads[sessionContinueType], err = marshalSessionContinue(sessionID, requestID)
+	payloads[sessionContinueType], err = marshalSessionContinue(sessionID, requestID, continuationID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payloads[sessionResultType], err = marshalSessionResult(sessionID, requestID, fixture.fileKey, "")
+	payloads[sessionResultType], err = marshalSessionResult(sessionID, requestID, continuationID, fixture.fileKey, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,10 +195,11 @@ func TestSessionProtocolParsersRejectWrongTypesAndBindings(t *testing.T) {
 			return unmarshalSessionReadyForTouch(payload, sessionID, requestID)
 		},
 		sessionContinueType: func(payload []byte) error {
-			return unmarshalSessionContinue(payload, sessionID, requestID)
+			_, err := unmarshalSessionContinue(payload, sessionID, requestID)
+			return err
 		},
 		sessionResultType: func(payload []byte) error {
-			key, err := unmarshalSessionResult(payload, sessionID, requestID)
+			key, err := unmarshalSessionResult(payload, sessionID, requestID, continuationID)
 			ClearSecret(key)
 			return err
 		},
@@ -210,18 +229,20 @@ func TestSessionProtocolParsersRejectWrongTypesAndBindings(t *testing.T) {
 			return unmarshalSessionReadyForTouch(payloads[sessionReadyForTouchType], sessionID, wrongRequestID)
 		},
 		"continue session": func() error {
-			return unmarshalSessionContinue(payloads[sessionContinueType], wrongSessionID, requestID)
+			_, err := unmarshalSessionContinue(payloads[sessionContinueType], wrongSessionID, requestID)
+			return err
 		},
 		"continue request": func() error {
-			return unmarshalSessionContinue(payloads[sessionContinueType], sessionID, wrongRequestID)
+			_, err := unmarshalSessionContinue(payloads[sessionContinueType], sessionID, wrongRequestID)
+			return err
 		},
 		"result session": func() error {
-			key, err := unmarshalSessionResult(payloads[sessionResultType], wrongSessionID, requestID)
+			key, err := unmarshalSessionResult(payloads[sessionResultType], wrongSessionID, requestID, continuationID)
 			ClearSecret(key)
 			return err
 		},
 		"result request": func() error {
-			key, err := unmarshalSessionResult(payloads[sessionResultType], sessionID, wrongRequestID)
+			key, err := unmarshalSessionResult(payloads[sessionResultType], sessionID, wrongRequestID, continuationID)
 			ClearSecret(key)
 			return err
 		},
@@ -247,13 +268,13 @@ func TestSessionProtocolRejectsNonCanonicalMalformedAndOversizedMessages(t *test
 
 	mutations := map[string][]byte{
 		"empty":         nil,
-		"malformed":     []byte(`{"version":1`),
+		"malformed":     []byte(`{"version":2`),
 		"leading space": append([]byte{' '}, ready...),
 		"trailing byte": append(append([]byte(nil), ready...), '\n'),
-		"field reorder": []byte(fmt.Sprintf(`{"type":"session_ready","version":1,"session_id":"%s","request_id":"%s"}`, sessionHex, requestHex)),
+		"field reorder": []byte(fmt.Sprintf(`{"type":"session_ready","version":2,"session_id":"%s","request_id":"%s"}`, sessionHex, requestHex)),
 		"duplicate":     bytes.Replace(ready, []byte(`"type":"session_ready"`), []byte(`"type":"session_ready","type":"session_ready"`), 1),
 		"unknown":       bytes.Replace(ready, []byte(`"type":"session_ready"`), []byte(`"type":"session_ready","unknown":true`), 1),
-		"wrong version": bytes.Replace(ready, []byte(`"version":1`), []byte(`"version":2`), 1),
+		"wrong version": bytes.Replace(ready, []byte(`"version":2`), []byte(`"version":1`), 1),
 		"uppercase id":  bytes.Replace(ready, []byte(sessionHex), []byte(strings.ToUpper(sessionHex)), 1),
 		"short id":      bytes.Replace(ready, []byte(sessionHex), []byte(sessionHex[:30]), 1),
 		"zero id":       bytes.Replace(ready, []byte(sessionHex), []byte(strings.Repeat("0", encodedIdentifierSize)), 1),
@@ -296,9 +317,11 @@ func TestSessionProtocolRejectsNonCanonicalMalformedAndOversizedMessages(t *test
 
 func TestSessionResultRequiresExclusiveExactFileKeyOrFixedError(t *testing.T) {
 	sessionID, requestID := fixedSessionBinding()
+	continuationID := fixedContinuationBinding()
 	sessionHex := hex.EncodeToString(sessionID[:])
 	requestHex := hex.EncodeToString(requestID[:])
-	prefix := fmt.Sprintf(`{"version":1,"type":"result","session_id":"%s","request_id":"%s",`, sessionHex, requestHex)
+	continuationHex := hex.EncodeToString(continuationID[:])
+	prefix := fmt.Sprintf(`{"version":2,"type":"result","session_id":"%s","request_id":"%s","continuation_id":"%s",`, sessionHex, requestHex, continuationHex)
 	validKey := `[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]`
 
 	invalid := map[string]string{
@@ -318,7 +341,7 @@ func TestSessionResultRequiresExclusiveExactFileKeyOrFixedError(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			encoded := []byte(payload)
 			defer clear(encoded)
-			key, err := unmarshalSessionResult(encoded, sessionID, requestID)
+			key, err := unmarshalSessionResult(encoded, sessionID, requestID, continuationID)
 			ClearSecret(key)
 			if ErrorClassOf(err) != ErrorHelper {
 				t.Fatalf("error class = %q", ErrorClassOf(err))
@@ -326,26 +349,26 @@ func TestSessionResultRequiresExclusiveExactFileKeyOrFixedError(t *testing.T) {
 		})
 	}
 
-	if _, err := marshalSessionResult(sessionID, requestID, []byte("short"), ""); ErrorClassOf(err) != ErrorHelper {
+	if _, err := marshalSessionResult(sessionID, requestID, continuationID, []byte("short"), ""); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("short file key was encoded")
 	}
-	if _, err := marshalSessionResult(sessionID, requestID, []byte("0123456789abcdef"), ErrorHardware); ErrorClassOf(err) != ErrorHelper {
+	if _, err := marshalSessionResult(sessionID, requestID, continuationID, []byte("0123456789abcdef"), ErrorHardware); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("mixed file key and error were encoded")
 	}
-	payload, err := marshalSessionResult(sessionID, requestID, nil, ErrorClass("private"))
+	payload, err := marshalSessionResult(sessionID, requestID, continuationID, nil, ErrorClass("private"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(payload)
-	if _, err := unmarshalSessionResult(payload, sessionID, requestID); ErrorClassOf(err) != ErrorHelper {
+	if _, err := unmarshalSessionResult(payload, sessionID, requestID, continuationID); ErrorClassOf(err) != ErrorHelper {
 		t.Fatal("unknown result error did not collapse to helper_failed")
 	}
 	for _, class := range []ErrorClass{ErrorRecoveryUnavailable, ErrorRecoveryMismatch} {
-		payload, err := marshalSessionResult(sessionID, requestID, nil, class)
+		payload, err := marshalSessionResult(sessionID, requestID, continuationID, nil, class)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := unmarshalSessionResult(payload, sessionID, requestID); ErrorClassOf(err) != ErrorHelper {
+		if _, err := unmarshalSessionResult(payload, sessionID, requestID, continuationID); ErrorClassOf(err) != ErrorHelper {
 			clear(payload)
 			t.Fatalf("recovery class %q crossed the hardware session protocol", class)
 		}
@@ -412,4 +435,12 @@ func differentSessionBinding() (sessionIdentifier, requestIdentifier) {
 		requestID[index] = byte(index + 97)
 	}
 	return sessionID, requestID
+}
+
+func fixedContinuationBinding() continuationIdentifier {
+	var continuationID continuationIdentifier
+	for index := range continuationID {
+		continuationID[index] = byte(index + 129)
+	}
+	return continuationID
 }

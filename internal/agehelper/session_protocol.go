@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	sessionProtocolVersion  = 1
+	sessionProtocolVersion  = 2
 	identifierSize          = 16
 	encodedIdentifierSize   = identifierSize * 2
 	maxSessionRequestFrame  = maxRequestFrame + 256
@@ -29,6 +29,7 @@ const (
 
 type sessionIdentifier [identifierSize]byte
 type requestIdentifier [identifierSize]byte
+type continuationIdentifier [identifierSize]byte
 
 func newSessionIdentifier() (sessionIdentifier, error) {
 	var identifier sessionIdentifier
@@ -42,6 +43,14 @@ func newRequestIdentifier() (requestIdentifier, error) {
 	var identifier requestIdentifier
 	if err := fillIdentifier(identifier[:]); err != nil {
 		return requestIdentifier{}, err
+	}
+	return identifier, nil
+}
+
+func newContinuationIdentifier() (continuationIdentifier, error) {
+	var identifier continuationIdentifier
+	if err := fillIdentifier(identifier[:]); err != nil {
+		return continuationIdentifier{}, err
 	}
 	return identifier, nil
 }
@@ -86,6 +95,24 @@ func (identifier requestIdentifier) MarshalJSON() ([]byte, error) {
 func (identifier *requestIdentifier) UnmarshalJSON(encoded []byte) error {
 	if identifier == nil {
 		return errors.New("request identifier destination is nil")
+	}
+	decoded, err := unmarshalIdentifierJSON(encoded)
+	if err != nil {
+		clear(identifier[:])
+		return err
+	}
+	copy(identifier[:], decoded[:])
+	clear(decoded[:])
+	return nil
+}
+
+func (identifier continuationIdentifier) MarshalJSON() ([]byte, error) {
+	return marshalIdentifierJSON(identifier[:])
+}
+
+func (identifier *continuationIdentifier) UnmarshalJSON(encoded []byte) error {
+	if identifier == nil {
+		return errors.New("continuation identifier destination is nil")
 	}
 	decoded, err := unmarshalIdentifierJSON(encoded)
 	if err != nil {
@@ -159,20 +186,22 @@ type wireSessionReadyForTouch struct {
 }
 
 type wireSessionContinue struct {
-	Version   int               `json:"version"`
-	Type      string            `json:"type"`
-	SessionID sessionIdentifier `json:"session_id"`
-	RequestID requestIdentifier `json:"request_id"`
+	Version        int                    `json:"version"`
+	Type           string                 `json:"type"`
+	SessionID      sessionIdentifier      `json:"session_id"`
+	RequestID      requestIdentifier      `json:"request_id"`
+	ContinuationID continuationIdentifier `json:"continuation_id"`
 }
 
 type wireSessionResult struct {
-	Version   int               `json:"version"`
-	Type      string            `json:"type"`
-	SessionID sessionIdentifier `json:"session_id"`
-	RequestID requestIdentifier `json:"request_id"`
-	OK        bool              `json:"ok"`
-	FileKey   *wireFileKey      `json:"file_key,omitempty"`
-	Error     ErrorClass        `json:"error,omitempty"`
+	Version        int                     `json:"version"`
+	Type           string                  `json:"type"`
+	SessionID      sessionIdentifier       `json:"session_id"`
+	RequestID      requestIdentifier       `json:"request_id"`
+	ContinuationID *continuationIdentifier `json:"continuation_id,omitempty"`
+	OK             bool                    `json:"ok"`
+	FileKey        *wireFileKey            `json:"file_key,omitempty"`
+	Error          ErrorClass              `json:"error,omitempty"`
 }
 
 func marshalSessionRequest(sessionID sessionIdentifier, requestID requestIdentifier, request Request) ([]byte, error) {
@@ -207,7 +236,8 @@ func unmarshalSessionRequest(encoded []byte, expectedSessionID sessionIdentifier
 	}
 	var wire wireSessionRequest
 	if err := decodeStrictJSON(encoded, &wire); err != nil ||
-		wire.Version != sessionProtocolVersion || wire.Type != sessionRequestType || wire.SessionID != expectedSessionID {
+		wire.Version != sessionProtocolVersion || wire.Type != sessionRequestType || wire.SessionID != expectedSessionID ||
+		!identifierIsValid(wire.RequestID[:]) {
 		return requestIdentifier{}, Request{}, classError(ErrorInvalidRequest)
 	}
 	request, err := sessionRequestFromEnvelope(wire.Envelope)
@@ -283,28 +313,75 @@ func unmarshalSessionReadyForTouch(encoded []byte, expectedSessionID sessionIden
 	return nil
 }
 
-func marshalSessionContinue(sessionID sessionIdentifier, requestID requestIdentifier) ([]byte, error) {
+func marshalSessionContinue(
+	sessionID sessionIdentifier,
+	requestID requestIdentifier,
+	continuationID continuationIdentifier,
+) ([]byte, error) {
 	encoded, err := json.Marshal(wireSessionContinue{
 		Version: sessionProtocolVersion, Type: sessionContinueType, SessionID: sessionID, RequestID: requestID,
+		ContinuationID: continuationID,
 	})
 	return checkedSessionResponse(encoded, err)
 }
 
-func unmarshalSessionContinue(encoded []byte, expectedSessionID sessionIdentifier, expectedRequestID requestIdentifier) error {
+func unmarshalSessionContinue(
+	encoded []byte,
+	expectedSessionID sessionIdentifier,
+	expectedRequestID requestIdentifier,
+) (continuationIdentifier, error) {
 	if !validSessionResponseInput(encoded, expectedSessionID, expectedRequestID) {
-		return classError(ErrorHelper)
+		return continuationIdentifier{}, classError(ErrorHelper)
 	}
 	var wire wireSessionContinue
 	if err := decodeStrictJSON(encoded, &wire); err != nil || wire.Version != sessionProtocolVersion ||
-		wire.Type != sessionContinueType || wire.SessionID != expectedSessionID || wire.RequestID != expectedRequestID {
-		return classError(ErrorHelper)
+		wire.Type != sessionContinueType || wire.SessionID != expectedSessionID || wire.RequestID != expectedRequestID ||
+		!identifierIsValid(wire.ContinuationID[:]) {
+		return continuationIdentifier{}, classError(ErrorHelper)
 	}
-	return nil
+	return wire.ContinuationID, nil
 }
 
-func marshalSessionResult(sessionID sessionIdentifier, requestID requestIdentifier, fileKey []byte, class ErrorClass) ([]byte, error) {
+func marshalSessionEarlyResult(sessionID sessionIdentifier, requestID requestIdentifier, class ErrorClass) ([]byte, error) {
+	if !validHardwareSessionErrorClass(class) {
+		return nil, classError(ErrorHelper)
+	}
+	encoded, err := json.Marshal(wireSessionResult{
+		Version: sessionProtocolVersion, Type: sessionResultType, SessionID: sessionID, RequestID: requestID, Error: class,
+	})
+	return checkedSessionResponse(encoded, err)
+}
+
+func unmarshalSessionEarlyResult(
+	encoded []byte,
+	expectedSessionID sessionIdentifier,
+	expectedRequestID requestIdentifier,
+) error {
+	wire, err := unmarshalSessionResultWire(encoded, expectedSessionID, expectedRequestID)
+	if err != nil {
+		return err
+	}
+	defer clearWireFileKey(wire.FileKey)
+	if wire.ContinuationID != nil || wire.OK || wire.FileKey != nil || !validHardwareSessionErrorClass(wire.Error) {
+		return classError(ErrorHelper)
+	}
+	return classError(wire.Error)
+}
+
+func marshalSessionResult(
+	sessionID sessionIdentifier,
+	requestID requestIdentifier,
+	continuationID continuationIdentifier,
+	fileKey []byte,
+	class ErrorClass,
+) ([]byte, error) {
+	if !identifierIsValid(continuationID[:]) {
+		return nil, classError(ErrorHelper)
+	}
+	continuationCopy := continuationID
 	wire := wireSessionResult{
 		Version: sessionProtocolVersion, Type: sessionResultType, SessionID: sessionID, RequestID: requestID,
+		ContinuationID: &continuationCopy,
 	}
 	var encodedKey wireFileKey
 	defer clear(encodedKey[:])
@@ -332,17 +409,19 @@ func unmarshalSessionResult(
 	encoded []byte,
 	expectedSessionID sessionIdentifier,
 	expectedRequestID requestIdentifier,
+	expectedContinuationID continuationIdentifier,
 ) ([]byte, error) {
-	if !validSessionResponseInput(encoded, expectedSessionID, expectedRequestID) {
+	if !identifierIsValid(expectedContinuationID[:]) {
 		return nil, classError(ErrorHelper)
 	}
-	var wire wireSessionResult
-	if err := decodeStrictJSON(encoded, &wire); err != nil || wire.Version != sessionProtocolVersion ||
-		wire.Type != sessionResultType || wire.SessionID != expectedSessionID || wire.RequestID != expectedRequestID {
-		clearWireFileKey(wire.FileKey)
-		return nil, classError(ErrorHelper)
+	wire, err := unmarshalSessionResultWire(encoded, expectedSessionID, expectedRequestID)
+	if err != nil {
+		return nil, err
 	}
 	defer clearWireFileKey(wire.FileKey)
+	if wire.ContinuationID == nil || *wire.ContinuationID != expectedContinuationID {
+		return nil, classError(ErrorHelper)
+	}
 	if wire.OK {
 		if wire.Error != "" || wire.FileKey == nil {
 			return nil, classError(ErrorHelper)
@@ -355,6 +434,23 @@ func unmarshalSessionResult(
 		return nil, classError(ErrorHelper)
 	}
 	return nil, classError(wire.Error)
+}
+
+func unmarshalSessionResultWire(
+	encoded []byte,
+	expectedSessionID sessionIdentifier,
+	expectedRequestID requestIdentifier,
+) (wireSessionResult, error) {
+	if !validSessionResponseInput(encoded, expectedSessionID, expectedRequestID) {
+		return wireSessionResult{}, classError(ErrorHelper)
+	}
+	var wire wireSessionResult
+	if err := decodeStrictJSON(encoded, &wire); err != nil || wire.Version != sessionProtocolVersion ||
+		wire.Type != sessionResultType || wire.SessionID != expectedSessionID || wire.RequestID != expectedRequestID {
+		clearWireFileKey(wire.FileKey)
+		return wireSessionResult{}, classError(ErrorHelper)
+	}
+	return wire, nil
 }
 
 func validHardwareSessionErrorClass(class ErrorClass) bool {
