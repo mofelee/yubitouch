@@ -13,6 +13,14 @@ YubiTouch 是独立开源项目，与 Yubico 没有关联，也未获得 Yubico 
 > 1Password Go SDK、原生 UI 和主要真实环境兼容性验证已经完成。项目只支持用户从可信
 > 源码在本机完成构建与安装，不计划提供预编译应用、Developer ID 签名/公证或 Homebrew 包。
 
+age 用户可以直接阅读：
+
+- [使用 YubiTouch 保护 age 文件](docs/age-tutorial.md)：从 hardware-only 到可选 1Password
+  recovery 的完整操作教程；
+- [YubiTouch age 功能参考](docs/age-reference.md)：路径选择、session 复用、协议、安全边界、
+  状态分类和密钥轮换；
+- [真实环境验证矩阵](docs/verification.md#age-插件21)：arm64 硬件和 1Password 验收记录。
+
 <p align="center">
   <img src="docs/images/touch-notification.webp" alt="YubiTouch SSH 签名触摸提醒" width="760">
 </p>
@@ -413,6 +421,10 @@ YubiTouch 触摸浮层。推送到 GitHub 后，正确关联的签名会显示 `
 
 ### 6. 配置并使用 age
 
+第一次配置建议按 [age 使用教程](docs/age-tutorial.md) 顺序执行；路径选择、密文兼容性、
+session 生命周期和安全限制集中记录在 [age 功能参考](docs/age-reference.md)。本节保留安装流程
+所需的内联摘要。
+
 age 功能只读取和使用用户已经配置好的 PIV X25519 key，不生成、导入、覆盖、删除或同步
 YubiKey 密钥。MVP 只有一个 profile：一把由十进制 serial、PIV slot 和 `x25519` 明确定位的
 硬件主密钥，以及最多一把可选的 1Password 恢复密钥。硬件 key 与 SSH 使用的 9A
@@ -673,6 +685,10 @@ daemon 的设备 probe 与 CLI 首次公钥读取还分别通过有界私有 pip
 断开时关闭 pipe、杀死整个独立进程组并完成唯一一次 `wait`，下一次请求不会复用该 child。
 
 ## age 插件协议
+
+完整的组件、状态机、协议字段、密钥生命周期和错误分类见
+[YubiTouch age 功能参考](docs/age-reference.md)。下面保留 v1 密码学格式摘要，供审阅源码和
+兼容性实现时使用。
 
 `age1yubitouch1...` recipient 的 v1 二进制 payload 固定为：版本、`x25519` 算法号、recovery
 flag、零保留字节、16 字节 profile ID、16 字节硬件 key ID 和 32 字节规范化硬件公钥；启用
@@ -1020,7 +1036,7 @@ recovery reference 或底层错误。age recovery 不改变 `agent_route`；SSH 
 | age 报告找不到插件 | 确认 `command -v age-plugin-yubitouch` 指向 App bundle 中精确同名的可执行文件；不要把主 `yubitouch` 二进制改名代替插件。 |
 | age identity 无法连接 daemon | 运行 `yubitouch ensure`，确认 `age_socket_reachable=true`；加密只需 recipient，不需要 daemon。 |
 | 缺卡时 age 没有进入 recovery | 只有目标设备连续两次明确 `not_detected` 且配置包含匹配的 recovery stanza 才允许恢复；任何 mismatch、探测异常或硬件操作失败都按设计失败闭合。 |
-| 同一 serial/slot 换 key 后报告 mismatch | 当前版本不会自动刷新 `age.public_key`；按“配置”一节停止 daemon、只删除该缓存字段、重新生成 recipient/identity 并 reload。不要继续分发旧 recipient。 |
+| 同一 serial/slot 换 key 后报告 mismatch | 当前版本不会自动刷新 `age.public_key`；按 [age 功能参考的更换硬件 key 流程](docs/age-reference.md#更换硬件-key)停止 daemon、只删除该缓存字段、重新生成 recipient/identity 并重启。不要继续分发旧 recipient。 |
 | 重建后版本哈希或界面看起来未更新 | 哈希是 Git commit，不是构建序号。用 `git rev-parse --short=12 HEAD` 核对，然后按 `yubitouch stop`、`ditto`、`yubitouch ensure` 的顺序替换运行中的 daemon。 |
 | 配置或路径修改后行为未变化 | 重新 `configure`，再运行 `yubitouch reload`。 |
 | stale socket/backend 错误 | 先 `yubitouch stop`，确认受管服务停止后再 `yubitouch ensure`；不要手工杀死未知 agent。 |
