@@ -365,5 +365,7 @@ YubiTouch 不能防御已经完全控制当前 macOS 用户或 root 的恶意软
 ## 相关文档
 
 - [age 使用教程](age-tutorial.md)
+- [在 YubiKey 内生成 X25519 私钥](piv-x25519-generate.md)
+- [导入已有 X25519 私钥](piv-x25519-import.md)
 - [项目安装、SSH 和通用配置](../README.md)
 - [真实环境验证矩阵](verification.md#age-插件21)

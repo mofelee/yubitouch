@@ -17,6 +17,10 @@ age 用户可以直接阅读：
 
 - [使用 YubiTouch 保护 age 文件](docs/age-tutorial.md)：从 hardware-only 到可选 1Password
   recovery 的完整操作教程；
+- [在 YubiKey 内生成 X25519 私钥](docs/piv-x25519-generate.md)：创建不可经 PIV 导出的全新
+  hardware key，并核对策略和公钥；
+- [导入已有 X25519 私钥](docs/piv-x25519-import.md)：把 PKCS#8 key 安全写入明确空闲的 PIV
+  槽位，并核对策略和公钥；
 - [YubiTouch age 功能参考](docs/age-reference.md)：路径选择、session 复用、协议、安全边界、
   状态分类和密钥轮换；
 - [真实环境验证矩阵](docs/verification.md#age-插件21)：arm64 硬件和 1Password 验收记录。
@@ -546,9 +550,11 @@ session 生命周期和安全限制集中记录在 [age 功能参考](docs/age-r
 所需的内联摘要。
 
 age 功能只读取和使用用户已经配置好的 PIV X25519 key，不生成、导入、覆盖、删除或同步
-YubiKey 密钥。MVP 只有一个 profile：一把由十进制 serial、PIV slot 和 `x25519` 明确定位的
-硬件主密钥，以及最多一把可选的 1Password 恢复密钥。硬件 key 与 SSH 使用的 9A
-ED25519 key 是两个独立槽位和用途；不要把 SSH 私钥当作 age ECDH key。
+YubiKey 密钥。全新 key 首选按 [设备内生成教程](docs/piv-x25519-generate.md)创建；需要保留
+现有 PKCS#8 X25519 私钥时，按 [独立导入教程](docs/piv-x25519-import.md)写入明确空闲的槽位。
+MVP 只有一个 profile：一把由十进制 serial、PIV slot 和 `x25519` 明确定位的硬件主密钥，
+以及最多一把可选的 1Password 恢复密钥。硬件 key 与 SSH 使用的 9A ED25519 key 是两个独立
+槽位和用途；不要把 SSH 私钥当作 age ECDH key。
 
 配置硬件主路径时，把占位值替换为本机读取的目标设备信息，不要把完整 serial 贴到 Issue、
 日志或终端共享记录中：
