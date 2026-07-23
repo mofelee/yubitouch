@@ -485,11 +485,22 @@ age -d -i identity.txt -o secret.txt secret.txt.age
 
 保存 recipient 后，加密只使用其中的公开材料，不连接 daemon、YubiKey 或 1Password；即使
 设备已拔出、daemon 已停止仍可加密。解密统一连接私有 `~/.ssh/yubitouch/age.sock`。目标
-YubiKey 已连接时只走硬件 stanza，并与 SSH 签名共享同一条全局 PIV 队列。hardware helper
-会先完成配置的 PIN provider；在 PIN 输入或 1Password 授权尚未结束时不显示 YubiTouch
-触摸提示。只有 PIN 成功取得且 YKCS11 login 验证通过后，daemon 才显示“age 解密”触摸
-提示并允许 helper 继续执行 ECDH。只有两次有界且成功的目标探测都明确返回
-`not_detected`，中间经过短暂去抖，才会启动一次 recovery helper。
+YubiKey 已连接时只走硬件 stanza，并与 SSH 签名共享同一条全局 PIV 队列。daemon 管理一个
+隔离的常驻 hardware helper，由它持有 YKCS11 module、已登录 session 和目标 private object，
+daemon 本体不持有 PKCS#11 session。
+
+第一次硬件解密会启动独立的一次性 PIN resolver。resolver 取得 PIN 后通过有界私有 pipe 交给
+hardware helper，关闭输出并退出；hardware helper 必须先等待并回收 resolver，才执行
+`C_Login`，随后立即清零可变 PIN 缓冲区。因此常驻 helper 只保留 YubiKey 的已认证 session，
+不保留可再次读取的 PIN 值。成功请求不会销毁该 session；同一 session 内的后续解密不再调用
+PIN provider，但仍会重新校验 session/key，并且每次都必须经过独立的
+`ready_for_touch -> UI -> continue -> CKM_ECDH1_DERIVE` 回合。每次 ECDH 创建的派生对象仍在
+该次操作结束前独立销毁。
+
+在 PIN 输入或 1Password 授权尚未结束时不显示 YubiTouch 触摸提示。只有 resolver 已退出并
+回收、YKCS11 login 和 session/key 验证成功，daemon 才显示“age 解密”触摸提示并允许 helper
+继续执行 ECDH。只有两次有界且成功的目标探测都明确返回 `not_detected`，中间经过短暂去抖，
+才会启动一次 recovery helper；recovery helper 每次请求后退出，不复用 recovery identity。
 
 插入其他 YubiKey、serial/slot/算法/公钥不匹配、探测失败或状态不明、PIN 错误、PIN provider
 失败或取消、触摸取消或超时，以及 YKCS11/ECDH/KDF/AEAD 失败都直接失败，不访问 recovery；
@@ -497,13 +508,28 @@ PIN 错误和 PIN provider 失败/取消也不会显示触摸提示。
 一旦同一请求选择并开始硬件路径，就绝不会切换到 recovery。1Password 授权失败/取消、恢复
 identity 解析失败或与配置 recipient 不匹配同样只失败一次，不尝试其他 key。
 
+常驻 hardware helper/session 在以下任一条件出现时销毁并完成进程回收；下一次硬件解密重新
+启动一次性 PIN resolver 并登录：
+
+- IOKit 报告任何 YubiKey 插入或移除事件，包括设备总数未变化的替换；
+- 配置 reload，包括目标 serial、slot、algorithm 或 public key 改变；
+- daemon 停止、重载、崩溃或重启，hardware helper 自身退出或重启；
+- PKCS#11 token、session 或 private object 失效，hardware helper 内的硬件/ECDH/解包或严格帧协议返回错误，或前一次结果状态无法确认；
+- 当前请求被客户端或触摸 UI 取消、断开或超时；
+- helper 的父进程身份、代码身份或生命周期验证失败，或设备事件流异常关闭。
+
+已经进入常驻 helper 的 hardware 请求只有正常解密成功才保留 session；首版没有额外的空闲或
+绝对 TTL。设备重插或旧 session 在私钥操作前已明确失效时，下一次请求可以建立新 session；
+ECDH 已开始或结果状态不明时绝不自动重试。
+
 在 macOS+cgo 构建中，hardware/recovery 私钥 helper 会在读取配置前及执行敏感操作前验证
 直接父进程：父子必须属于同一用户，具有相同的完整可执行路径和代码身份，并都启用 Hardened
 Runtime；未加固、被动态库注入、经 shell 或其他可执行文件直接启动都会失败关闭。其他平台或
 未启用 cgo 的构建不提供这项认证，因此私钥 helper 一律拒绝运行。应使用 `make app` 或
 `make build` 生成经过本地 runtime 签名的源码构建产物，直接 `go build` 的二进制不能运行私钥
-helper。daemon 还通过专用生命周期管道持有每个一次性私钥 helper；daemon 崩溃或被强制终止
-时，helper 会立即终止自己的整个进程组，不会脱离原超时继续持有 PIN、SDK 或硬件会话。
+helper。daemon 通过专用生命周期管道持有常驻 hardware helper 和每个一次性 recovery helper；
+daemon 崩溃或被强制终止时，helper 会立即终止自己的整个进程组，不会脱离原生命周期继续
+持有 SDK secret 或硬件 session。
 
 > 启用 recovery 会降低整份密文的整体安全级别：硬件 key 和恢复 key 是任一方都能独立
 > 解密的 OR 关系，安全性取两条路径中较弱的一条。1Password SDK 以不可变 Go `string`
@@ -632,8 +658,9 @@ age 使用独立的数据流，不经过 SSH Agent 路由：
 age -> age-plugin-yubitouch -> ~/.ssh/yubitouch/age.sock -> daemon
                                                         +-> one-shot public/probe helper
                                                         |      `-> YKCS11 public read
-                                                        +-> one-shot hardware helper
-                                                        |      `-> YKCS11 / PIV X25519 ECDH
+                                                        +-> persistent hardware helper
+                                                        |      +-> one-shot PIN resolver
+                                                        |      `-> reusable YKCS11 session / PIV X25519 ECDH
                                                         `-> one-shot recovery helper / 1Password
 ```
 
@@ -1020,13 +1047,19 @@ recovery reference 或底层错误。age recovery 不改变 `agent_route`；SSH 
 - age recipient/identity 不编码设备 serial、slot、PIN、1Password reference 或私钥；daemon 会把其中的稳定 ID 与配置及实际槽位公钥重新绑定校验。
 - age 硬件路径的 PIV X25519 ECDH 与 SSH 签名共用全局串行队列；已选择硬件的请求失败时绝不切换到 recovery。
 - age 公钥读取和目标 probe 各自在无 PIN、无私钥能力的一次性 helper 中运行；目标只走有界 pipe，超时/取消会杀进程组并回收，避免同步 PKCS#11 cgo 阻塞 daemon 或 CLI。
+- PIN 只从一次性 resolver 进入 hardware helper；X25519 shared secret 和私钥操作留在 helper/YubiKey。daemon 只接收并转交成功解包的 16 字节 file key，不接收 PIN、shared secret 或私钥。
+- age hardware helper 由 daemon 隔离并常驻，只保留已认证的 YKCS11 session；一次性 PIN resolver 在 `C_Login` 前退出并被回收，PIN 登录后清零。正常成功复用 session，但每次 ECDH 仍要求 `Touch policy: ALWAYS` 和独立触摸门控。
+- 任意 YubiKey 插拔、配置 reload、daemon/helper 重启、session/硬件/协议错误、取消、断开、超时或父进程验证失败都会销毁并回收 hardware helper；状态不明时不复用或自动重试。
 - recovery 私钥只在明确连续缺卡后进入一次性 helper。helper 重新读取配置、只解析一个指定 identity、校验其公开 recipient、在进程内完成解包，只返回 file key，并在超时或取消时被终止和回收。
 - 启用 recovery 后，恢复私钥本身足以解密；整体安全级别不再高于 1Password 软件恢复路径。SDK 返回的 secret `string` 无法可靠清零，进程快速退出才是主要隔离边界。
 - 本地 daemon/plugin/helper 只输出预定义错误分类。上游 `AGEDEBUG=plugin` 不受此边界约束，可能把协议内容或 file key 写入调试输出。
 - ProxyJump 不需要 Agent Forwarding。`ForwardAgent yes` 只能对完全可信的 Host 启用，因为远程主机可在连接存活期间使用当前路由上的签名能力。
 
-YubiTouch 不能防御已经完全控制当前 macOS 用户或 root 的恶意软件，也不能消除用户触摸
-期间同权限恶意进程抢用 Agent 的风险。
+YubiTouch 不能防御已经完全控制当前 macOS 用户或 root 的恶意软件。age socket 只验证对端
+属于同一 UID；已认证 hardware session 有效期间，同 UID 恶意进程可以提交一个绑定到已配置
+key 的解密请求并等待用户触摸。每次 ECDH 仍需要 YubiKey 触摸，触摸 UI 会显示解析出的请求
+程序身份供用户判断，但 session 复用扩大了“不再用 PIN 再次确认”的时间窗口。SSH Agent 同样
+不能消除用户触摸期间同权限恶意进程抢用签名能力的风险。
 
 ## 故障恢复
 

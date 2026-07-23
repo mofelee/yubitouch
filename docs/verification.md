@@ -216,7 +216,8 @@ yubitouch status --json | jq '{
 窗口保持未完成时等待，期间没有出现 YubiTouch 触摸面板；授权完成后才显示“age 解密”触摸
 提示。两次触摸后 `age` 均以 0 退出，解密结果均与原文匹配，脱敏状态依次记录
 `age_hardware_selected` 和 `age_decrypt_succeeded`。本次配置未启用 recovery，因此不改变下方
-真实 recovery 矩阵的 `pending` 状态。
+真实 recovery 矩阵的 `pending` 状态。这是 #21 每次启动一次性 hardware helper 的历史基线，
+不能作为 #23 session 复用已经通过的证据。
 
 错误 PIN 会消耗 YubiKey 的有限重试次数。只允许在已确认剩余次数、拥有可靠恢复方案且专门
 用于测试的设备上验证；不得为了补齐矩阵而对日常使用设备尝试错误 PIN，并确认实现不会自动
@@ -225,6 +226,107 @@ yubitouch status --json | jq '{
 另以一个等待中的 SSH 签名和一个 age 解密互换先后顺序，确认两者共享全局 PIV 队列且一次
 只有一个进入 PIN/触摸/私钥操作。取消仍在排队的请求时，不得启动其 PIN、UI 或 PIV 操作；
 客户端断开和触摸 UI 取消只影响对应 request ID，下一条请求仍可成功。
+
+### 已认证 hardware session 复用（#23）
+
+本节只验收 arm64 源码签名 App，初始结果一律为 `pending`。自动化测试通过不能代替真实
+`PIN=ONCE, touch=ALWAYS` YubiKey、1Password/PIN provider、触摸和设备拔插结果，也不能把
+Issue #21 的连续两次一次性解密结果沿用为 #23 的通过记录。
+
+hardware 路径由 daemon 管理的隔离常驻 helper 持有已认证 YKCS11 session。第一次请求的
+PIN resolver 仍是一次性进程：它发送有界响应后退出并被 `wait` 回收，hardware helper 此后才
+执行 login，并在 login 后清零 PIN 缓冲区。正常成功保留 session；后续请求不再运行 resolver，
+但每次仍独立执行 `ready_for_touch -> continue -> CKM_ECDH1_DERIVE`。recovery 路径不参与本节，
+其 helper 和 identity 生命周期仍保持一次请求一次进程。
+
+开始前使用专用测试配置和不含敏感内容的 `plaintext.age`，复用上文私有
+`$age_verify_dir` 中的文件。不要设置 `AGEDEBUG=plugin`，不要打印 identity、recipient、完整
+serial、`op://` reference、PIN、file key 或 shared secret。先确认架构并创建只保存明文输出的
+私有目录，然后重载 daemon 以明确清除旧 session：
+
+```sh
+test "$(uname -m)" = arm64
+test -r "$age_verify_dir/identity.txt"
+test -r "$age_verify_dir/plaintext"
+test -r "$age_verify_dir/plaintext.age"
+
+issue23_verify_dir="$(mktemp -d "$age_verify_dir/issue23.XXXXXX")"
+chmod 700 "$issue23_verify_dir"
+yubitouch reload
+```
+
+第一次解密只运行下面这段。确认先完成一次 PIN provider（1Password 模式为一次 Desktop App
+授权），随后出现一次“age 解密”触摸提示；授权未结束前不得出现触摸提示：
+
+```sh
+issue23_first="$issue23_verify_dir/first"
+age -d -i "$age_verify_dir/identity.txt" \
+  -o "$issue23_first" "$age_verify_dir/plaintext.age"
+issue23_status=$?
+issue23_match=no
+if [ "$issue23_status" -eq 0 ] && cmp -s "$age_verify_dir/plaintext" "$issue23_first"; then
+  issue23_match=yes
+fi
+printf 'first_exit=%d plaintext_match=%s\n' "$issue23_status" "$issue23_match"
+```
+
+保持 YubiKey 插入，不重载或重启 daemon，紧接着运行第二段。不得再次出现 PIN 输入或
+1Password 授权，但必须再次显示独立的“age 解密”触摸提示：
+
+```sh
+issue23_second="$issue23_verify_dir/second"
+age -d -i "$age_verify_dir/identity.txt" \
+  -o "$issue23_second" "$age_verify_dir/plaintext.age"
+issue23_status=$?
+issue23_match=no
+if [ "$issue23_status" -eq 0 ] && cmp -s "$age_verify_dir/plaintext" "$issue23_second"; then
+  issue23_match=yes
+fi
+printf 'second_exit=%d plaintext_match=%s\n' "$issue23_status" "$issue23_match"
+```
+
+然后拔出 YubiKey，等待脱敏状态出现 `not_detected`；重新插入同一设备并等待 `connected`。
+只查看以下字段，不采集 serial 或配置内容：
+
+```sh
+yubitouch status --json | jq '{yubikey_state, age_socket_reachable}'
+```
+
+重新插入后的第一次解密运行第三段。它必须再次执行一次 PIN provider，然后显示一次触摸提示：
+
+```sh
+issue23_reinserted="$issue23_verify_dir/reinserted"
+age -d -i "$age_verify_dir/identity.txt" \
+  -o "$issue23_reinserted" "$age_verify_dir/plaintext.age"
+issue23_status=$?
+issue23_match=no
+if [ "$issue23_status" -eq 0 ] && cmp -s "$age_verify_dir/plaintext" "$issue23_reinserted"; then
+  issue23_match=yes
+fi
+printf 'reinserted_exit=%d plaintext_match=%s\n' "$issue23_status" "$issue23_match"
+```
+
+| arm64 场景 | PIN provider/login | 触摸 | 明文匹配 | 当前结果 |
+|---|---|---|---|---|
+| daemon 重载后的第一次解密 | 1 次 | 1 次 | yes | pending |
+| 同一 session 的第二次解密 | 0 次 | 1 次 | yes | pending |
+| 拔出并重新插入后的第一次解密 | 1 次 | 1 次 | yes | pending |
+
+真机报告只记录三行退出码/匹配结果、上述 UI 次数、版本和 Issue 链接。一次登录、两次独立
+derive，以及 resolver 已在 login 前退出回收，还必须与自动化/故障注入证据一起判断；不要为
+观察进程而运行可能打印进程环境或 secret reference 的命令。
+
+任何 IOKit YubiKey 插入/移除事件（即使总数仍为 1）、配置 reload（包括 serial、slot、
+algorithm 或 public key 改变）、daemon/helper 重启、PKCS#11 token/session/private object 或
+ECDH/解包/协议错误、客户端或 UI 取消、断开、超时、helper 异常退出、父进程身份/生命周期
+验证失败，以及设备事件流关闭，都会销毁并回收旧 helper/session。已经进入 hardware helper
+的请求除正常成功外都不保留 session；状态不明的结果不得复用或自动重试，正常 session 没有
+额外 TTL。
+
+session 复用的安全权衡也必须写入验收结论：私有 age socket 只能把调用者限制到同一 UID。
+已认证 session 有效期间，同 UID 恶意进程可以发起解密请求并等待用户触摸；每次 ECDH 的
+`Touch policy: ALWAYS` 和显示请求程序身份的触摸 UI 是此时的主要授权边界，不能把它描述为
+每次请求都由 PIN 再次确认。
 
 ### 严格 recovery
 
