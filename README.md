@@ -159,6 +159,8 @@ Attestation 槽位。如果行数检查失败，说明存在多个或没有 ED25
 
 ### 3. 构建并安装 YubiTouch
 
+#### 首次安装
+
 ```sh
 git clone https://github.com/mofelee/yubitouch.git
 cd yubitouch
@@ -183,11 +185,129 @@ command -v age-plugin-yubitouch
 `yubitouch` 和精确命名的 `age-plugin-yubitouch`，无需设置临时 `$YT` 变量。age 按插件名
 从 `PATH` 查找独立可执行文件；只链接 `yubitouch` 不能启用 age 集成。
 
+#### 覆盖重装或从源码更新
+
+已经安装过 YubiTouch 时，不要用 `ditto` 直接合并到正在使用的 App。下面的流程会先暂存并
+验证新 App，旧 daemon 此时继续运行；验证通过后才停服并切换，同时保留旧 App 供回滚。
+
+进入源码目录。需要更新源码时先执行 `git pull`；只重装当前 checkout 时跳过它：
+
+```sh
+cd /path/to/yubitouch
+git pull --ff-only
+```
+
+完成构建和测试，三条命令都成功后再继续：
+
+```sh
+make test
+make vet
+make app
+```
+
+确认暂存和回滚路径都不存在：
+
+```sh
+test ! -e /Applications/YubiTouch.app.new
+test ! -e /Applications/YubiTouch.app.previous
+```
+
+两个 `test` 都没有报错时，把新 App 复制到暂存路径并验证：
+
+```sh
+ditto dist/YubiTouch.app /Applications/YubiTouch.app.new
+codesign --verify --strict /Applications/YubiTouch.app.new
+codesign --verify --strict \
+  /Applications/YubiTouch.app.new/Contents/MacOS/age-plugin-yubitouch
+/Applications/YubiTouch.app.new/Contents/MacOS/yubitouch version
+```
+
+如果两个 `test` 中任意一个失败，说明上次重装留下了暂存或备份 App。先人工核对并处理它，
+不要执行后面的 `ditto`。到这里为止尚未停止旧 daemon；构建、复制或签名验证失败不会中断
+现有服务。
+
+在同一个终端中，从当前 LaunchAgent plist 读取本次要继续使用的配置路径：
+
+```sh
+CONFIG_PATH="$(/usr/libexec/PlistBuddy \
+  -c 'Print :ProgramArguments:3' \
+  "$HOME/Library/LaunchAgents/com.github.mofelee.yubitouch.plist")"
+test -r "$CONFIG_PATH"
+printf 'config=%s\n' "$CONFIG_PATH"
+env | awk -F= '/^YUBITOUCH_/ { print $1 }'
+```
+
+`CONFIG_PATH` 应是当前 plist 中 `--config` 后面的绝对路径；默认安装通常是
+`$HOME/.ssh/yubitouch/config.json`。最后一条命令通常不应输出内容。如果存在临时
+`YUBITOUCH_*` 变量，请先在干净终端中重新执行上面的 `CONFIG_PATH` 命令，避免 `configure`
+无意改写现有配置。需要主动切换到另一份配置时，应在停服前明确把 `CONFIG_PATH` 改为对应的
+绝对路径并确认文件可读。
+
+确认暂存 App 和配置路径后，停止旧 daemon，再用同一目录中的重命名切换 App：
+
+```sh
+/Applications/YubiTouch.app/Contents/MacOS/yubitouch stop &&
+mv /Applications/YubiTouch.app /Applications/YubiTouch.app.previous &&
+mv /Applications/YubiTouch.app.new /Applications/YubiTouch.app
+```
+
+任一条 `mv` 失败时不要继续。如果 `/Applications/YubiTouch.app` 仍然存在，直接重新启动它：
+
+```sh
+YUBITOUCH_CONFIG="$CONFIG_PATH" \
+  /Applications/YubiTouch.app/Contents/MacOS/yubitouch ensure
+```
+
+如果最终路径缺失但 `.previous` 存在，则先恢复旧 App 再启动：
+
+```sh
+mv /Applications/YubiTouch.app.previous /Applications/YubiTouch.app &&
+YUBITOUCH_CONFIG="$CONFIG_PATH" \
+  /Applications/YubiTouch.app/Contents/MacOS/yubitouch ensure
+```
+
+切换成功后，重新建立命令入口：
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -sfn /Applications/YubiTouch.app/Contents/MacOS/yubitouch \
+  "$HOME/.local/bin/yubitouch"
+ln -sfn /Applications/YubiTouch.app/Contents/MacOS/age-plugin-yubitouch \
+  "$HOME/.local/bin/age-plugin-yubitouch"
+
+command -v yubitouch
+command -v age-plugin-yubitouch
+```
+
+两个 `command -v` 结果应分别是 `$HOME/.local/bin/yubitouch` 和
+`$HOME/.local/bin/age-plugin-yubitouch`；否则先修正 `PATH`。然后核对版本：
+
+```sh
+git rev-parse --short=12 HEAD
+/Applications/YubiTouch.app/Contents/MacOS/yubitouch version
+```
+
+两条版本命令应显示相同的 commit。最后始终用新 App 的绝对路径迁移配置、启动 daemon 并
+检查状态：
+
+```sh
+YUBITOUCH_CONFIG="$CONFIG_PATH" \
+  /Applications/YubiTouch.app/Contents/MacOS/yubitouch configure &&
+YUBITOUCH_CONFIG="$CONFIG_PATH" \
+  /Applications/YubiTouch.app/Contents/MacOS/yubitouch ensure &&
+YUBITOUCH_CONFIG="$CONFIG_PATH" \
+  /Applications/YubiTouch.app/Contents/MacOS/yubitouch doctor
+```
+
+`doctor` 通过后，可以把 `/Applications/YubiTouch.app.previous` 移到废纸篓；在此之前保留它
+作为回滚副本。覆盖重装不会删除所选 `CONFIG_PATH`、age 描述符或 YubiKey 中的 key。只修改
+配置、没有替换 App 时，使用 `yubitouch reload` 即可。
+
 `yubitouch version` 中的十六进制值是构建时的 Git commit，不是每次 `make app` 都会变化的
 构建序号。同一个 commit 重新构建仍会显示同一个值；可以用 `git rev-parse --short=12 HEAD`
 核对。该命令只验证磁盘上的 CLI，不能证明已经运行的 LaunchAgent daemon 已经重启。
-首次安装请继续完成下一步的 `configure` 和 `ensure`；覆盖已有安装时请使用下文“从源码
-更新”的停服、复制和重新启动顺序。
+首次安装请继续完成下一步的 `configure` 和 `ensure`；已经有配置的覆盖重装在上述命令完成后
+即可继续使用。
 
 ### 4. 配置 PIN 来源并启动服务
 
@@ -563,34 +683,8 @@ yubitouch reload          重启服务并读取配置
 yubitouch stop            停止当前用户的 LaunchAgent
 ```
 
-从源码更新：
-
-```sh
-cd /path/to/yubitouch
-git pull --ff-only
-make test
-make vet
-make app
-
-# 必须先停止仍在运行的旧 daemon，再覆盖磁盘上的 App。
-yubitouch stop
-ditto dist/YubiTouch.app /Applications/YubiTouch.app
-
-# 这两行应显示相同的 commit；相同 commit 重建时哈希不会改变。
-git rev-parse --short=12 HEAD
-yubitouch version
-
-# 持久化新 schema 的默认值，再从刚复制的 App 启动 daemon。
-yubitouch configure
-yubitouch ensure
-yubitouch doctor
-```
-
-不要只运行 `make app`、`ditto` 和 `yubitouch version`：`version` 会启动一个短暂的 CLI
-进程读取新二进制，但原有 daemon 仍可能继续运行旧代码。上述
-`stop -> ditto -> configure -> ensure` 顺序会明确替换后台进程并持久化新 schema；
-更新非敏感配置但没有
-替换 App 时，使用 `yubitouch reload` 即可。
+从源码更新和覆盖重装请使用 [“构建并安装 YubiTouch”中的完整重装步骤](#覆盖重装或从源码更新)。
+该步骤会先验证新构建，再停止旧 daemon、替换 App、补全配置并启动新 daemon。
 
 从旧的单 socket 版本升级时，这一次 `configure` 会补全内部
 `~/.ssh/yubitouch/piv-agent.sock` 路径。新 daemon 会把旧的 `agent.sock` 替换为受管符号链接；
