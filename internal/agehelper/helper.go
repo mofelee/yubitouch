@@ -369,7 +369,7 @@ func configuredHardwarePublicKey(cfg config.Config) (ageprofile.PublicKey, bool)
 }
 
 func resolveRecoveryIdentity(ctx context.Context, account, reference string) (string, error) {
-	if err := onepassword.Secrets.ValidateSecretReference(ctx, reference); err != nil {
+	if err := config.ValidateOnePasswordSecretReference(reference); err != nil {
 		return "", err
 	}
 	client, err := onepassword.NewClient(

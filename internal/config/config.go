@@ -2,7 +2,6 @@ package config
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	onepassword "github.com/1password/onepassword-sdk-go"
 	"github.com/mofelee/yubitouch/internal/ageprofile"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
@@ -476,7 +474,7 @@ func (c *Config) ResolveAndValidate(home string) error {
 		if strings.TrimSpace(c.OnePasswordAccount) == "" {
 			return errors.New("onepassword_account is required for the 1password provider")
 		}
-		if !strings.HasPrefix(c.OnePasswordRef, "op://") {
+		if err := ValidateOnePasswordSecretReference(c.OnePasswordRef); err != nil {
 			return errors.New("onepassword_ref must be an op:// secret reference")
 		}
 	}
@@ -593,7 +591,7 @@ func (c *Config) resolveAndValidateAge() error {
 	if strings.TrimSpace(c.OnePasswordAccount) == "" {
 		return errors.New("onepassword_account is required for age recovery")
 	}
-	if err := ValidateAgeRecoveryIdentityReference(context.Background(), recovery.IdentityRef); err != nil {
+	if err := ValidateAgeRecoveryIdentityReference(recovery.IdentityRef); err != nil {
 		return err
 	}
 	recoveryPublicKey, err := ageprofile.ParseNativeRecipient(recovery.Recipient)
@@ -608,13 +606,10 @@ func (c *Config) resolveAndValidateAge() error {
 	return nil
 }
 
-// ValidateAgeRecoveryIdentityReference validates syntax only. It never resolves
-// the referenced recovery identity and intentionally discards SDK error details.
-func ValidateAgeRecoveryIdentityReference(ctx context.Context, reference string) error {
-	if strings.TrimSpace(reference) != reference {
-		return errors.New("age.recovery.identity_ref must be a valid 1Password secret reference")
-	}
-	if err := onepassword.Secrets.ValidateSecretReference(ctx, reference); err != nil {
+// ValidateAgeRecoveryIdentityReference validates syntax without resolving the
+// referenced identity or initializing the 1Password SDK runtime.
+func ValidateAgeRecoveryIdentityReference(reference string) error {
+	if err := ValidateOnePasswordSecretReference(reference); err != nil {
 		return errors.New("age.recovery.identity_ref must be a valid 1Password secret reference")
 	}
 	return nil

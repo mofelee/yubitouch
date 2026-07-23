@@ -43,9 +43,13 @@ func CheckOnePassword(ctx context.Context, cfg config.Config) error {
 	return checkOnePassword(
 		ctx,
 		cfg,
-		onepassword.Secrets.ValidateSecretReference,
+		validateSecretReference,
 		connectDesktopApp,
 	)
+}
+
+func validateSecretReference(_ context.Context, reference string) error {
+	return config.ValidateOnePasswordSecretReference(reference)
 }
 
 type referenceValidator func(context.Context, string) error

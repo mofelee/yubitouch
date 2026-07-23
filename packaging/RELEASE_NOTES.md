@@ -86,6 +86,12 @@ helper process group if the daemon exits unexpectedly. Initial age public-key ca
 serialized with configuration updates, merge only the cache into the latest configuration, and
 fail without output if the configured hardware target changed during the read.
 
+Secret-reference syntax validation uses a local, non-resolving parser for direct
+`op://vault/item/[section/]field` references. This avoids the 1Password SDK utility validator's
+WASM executable-memory requirement under Hardened Runtime without granting
+unsigned-executable-memory entitlements to the daemon or private helpers. Secret resolution and
+Desktop App authorization still use the official 1Password SDK.
+
 Enabling recovery lowers the security of the whole ciphertext: the hardware and recovery paths are
 an OR relationship, and either private key can decrypt independently. Do not use the upstream
 `AGEDEBUG=plugin` setting with real data; age debug output can expose plugin protocol contents and

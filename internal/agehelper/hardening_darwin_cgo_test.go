@@ -84,6 +84,9 @@ func TestParentVerificationRejectsUnsafeRuntimeEntitlements(t *testing.T) {
 
 	for _, entitlement := range []string{
 		"com.apple.security.cs.allow-dyld-environment-variables",
+		"com.apple.security.cs.allow-jit",
+		"com.apple.security.cs.allow-unsigned-executable-memory",
+		"com.apple.security.cs.disable-executable-page-protection",
 		"com.apple.security.get-task-allow",
 	} {
 		t.Run(entitlement, func(t *testing.T) {
@@ -153,6 +156,9 @@ func TestHardenedRuntimeBlocksInjectedParent(t *testing.T) {
 	if !strings.Contains(info, "runtime") ||
 		!strings.Contains(info, "com.apple.security.cs.disable-library-validation") ||
 		strings.Contains(info, "com.apple.security.cs.allow-dyld-environment-variables") ||
+		strings.Contains(info, "com.apple.security.cs.allow-jit") ||
+		strings.Contains(info, "com.apple.security.cs.allow-unsigned-executable-memory") ||
+		strings.Contains(info, "com.apple.security.cs.disable-executable-page-protection") ||
 		strings.Contains(info, "com.apple.security.get-task-allow") {
 		t.Fatal("hardened test signature has unexpected flags or entitlements")
 	}

@@ -97,6 +97,9 @@ static int YTCodeHash(
 			(process_status & required_status) == required_status &&
 			(process_status & kSecCodeStatusDebugged) == 0 &&
 			!YTUnsafeEntitlement(signing, CFSTR("com.apple.security.cs.allow-dyld-environment-variables")) &&
+			!YTUnsafeEntitlement(signing, CFSTR("com.apple.security.cs.allow-jit")) &&
+			!YTUnsafeEntitlement(signing, CFSTR("com.apple.security.cs.allow-unsigned-executable-memory")) &&
+			!YTUnsafeEntitlement(signing, CFSTR("com.apple.security.cs.disable-executable-page-protection")) &&
 			!YTUnsafeEntitlement(signing, CFSTR("com.apple.security.get-task-allow")) &&
 			hash_value != NULL && CFGetTypeID(hash_value) == CFDataGetTypeID()) {
 			CFDataRef hash = (CFDataRef)hash_value;

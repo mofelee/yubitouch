@@ -475,11 +475,11 @@ func runDoctor(stdout io.Writer, stderr io.Writer, env Environment) int {
 	return ExitOK
 }
 
-func doctorAgeRecoveryReference(ctx context.Context, cfg config.Config) (bool, string) {
+func doctorAgeRecoveryReference(_ context.Context, cfg config.Config) (bool, string) {
 	if cfg.Age == nil || cfg.Age.Recovery == nil {
 		return true, "not configured"
 	}
-	if err := config.ValidateAgeRecoveryIdentityReference(ctx, cfg.Age.Recovery.IdentityRef); err != nil {
+	if err := config.ValidateAgeRecoveryIdentityReference(cfg.Age.Recovery.IdentityRef); err != nil {
 		return false, "syntax is invalid; update the age recovery configuration and run configure again"
 	}
 	return true, "syntax is valid; the recovery identity was not resolved"
