@@ -409,35 +409,53 @@ func TestInternalHelperRejectsShellParent(t *testing.T) {
 
 func TestRunnerTimeoutKillsAndWaitsForProcessGroup(t *testing.T) {
 	fixture := newHelperFixture(t)
-	runner := testRunner(t, "hang", 200*time.Millisecond)
-	started := time.Now()
-	_, err := runner.Run(context.Background(), ModeHardware, Request{Envelope: fixture.hardwareEnvelope})
-	if ErrorClassOf(err) != ErrorTimeout {
-		t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorTimeout)
+	for _, test := range runnerModeCases(fixture) {
+		t.Run(test.name, func(t *testing.T) {
+			runner := testRunner(t, "hang", 200*time.Millisecond)
+			var command *exec.Cmd
+			runner.command = func(path string) *exec.Cmd {
+				command = exec.Command(path)
+				return command
+			}
+			started := time.Now()
+			_, err := runner.Run(context.Background(), test.mode, Request{Envelope: test.envelope})
+			if ErrorClassOf(err) != ErrorTimeout {
+				t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorTimeout)
+			}
+			if elapsed := time.Since(started); elapsed > 5*time.Second {
+				t.Fatalf("timeout took %s", elapsed)
+			}
+			assertRunnerCommandReaped(t, command)
+			if test.mode == ModeRecovery {
+				assertRecoveryRunnerHasNoContinueFD(t, command)
+			}
+			assertChildGone(t, runner.configPath+".pid")
+		})
 	}
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
-		t.Fatalf("timeout took %s", elapsed)
-	}
-	assertChildGone(t, runner.configPath+".pid")
 }
 
-func TestRunnerContextCancelBeforeReadyKillsAndReaps(t *testing.T) {
+func TestRunnerContextCancelKillsAndReaps(t *testing.T) {
 	fixture := newHelperFixture(t)
-	runner := testRunner(t, "hang", 10*time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	call, err := runner.Start(ctx, ModeHardware, Request{Envelope: fixture.hardwareEnvelope})
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range runnerModeCases(fixture) {
+		t.Run(test.name, func(t *testing.T) {
+			runner := testRunner(t, "hang", 10*time.Second)
+			ctx, cancel := context.WithCancel(context.Background())
+			call, err := runner.Start(ctx, test.mode, Request{Envelope: test.envelope})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = waitForPIDFile(t, runner.configPath+".pid")
+			cancel()
+			if _, err := call.Wait(); ErrorClassOf(err) != ErrorCanceled {
+				t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorCanceled)
+			}
+			assertRunnerCommandReaped(t, call.cmd)
+			if test.mode == ModeRecovery {
+				assertRecoveryRunnerHasNoContinueFD(t, call.cmd)
+			}
+			assertChildGone(t, runner.configPath+".pid")
+		})
 	}
-	_ = waitForPIDFile(t, runner.configPath+".pid")
-	cancel()
-	if err := call.WaitReady(); ErrorClassOf(err) != ErrorCanceled {
-		t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorCanceled)
-	}
-	if call.cmd.ProcessState == nil {
-		t.Fatal("canceled helper was not reaped before WaitReady returned")
-	}
-	assertChildGone(t, runner.configPath+".pid")
 }
 
 func TestRunnerCancelBetweenReadyAndContinue(t *testing.T) {
@@ -566,18 +584,31 @@ func TestContinueWriteFailureCannotReturnSuccess(t *testing.T) {
 
 func TestRunnerCancelCurrentKillsAndWaits(t *testing.T) {
 	fixture := newHelperFixture(t)
-	runner := testRunner(t, "cancel", 5*time.Second)
-	result := make(chan error, 1)
-	go func() {
-		_, err := runner.Run(context.Background(), ModeHardware, Request{Envelope: fixture.hardwareEnvelope})
-		result <- err
-	}()
-	_ = waitForPIDFile(t, runner.configPath+".pid")
-	runner.CancelCurrent()
-	if err := <-result; ErrorClassOf(err) != ErrorCanceled {
-		t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorCanceled)
+	for _, test := range runnerModeCases(fixture) {
+		t.Run(test.name, func(t *testing.T) {
+			runner := testRunner(t, "cancel", 5*time.Second)
+			var command *exec.Cmd
+			runner.command = func(path string) *exec.Cmd {
+				command = exec.Command(path)
+				return command
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, err := runner.Run(context.Background(), test.mode, Request{Envelope: test.envelope})
+				result <- err
+			}()
+			_ = waitForPIDFile(t, runner.configPath+".pid")
+			runner.CancelCurrent()
+			if err := <-result; ErrorClassOf(err) != ErrorCanceled {
+				t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorCanceled)
+			}
+			assertRunnerCommandReaped(t, command)
+			if test.mode == ModeRecovery {
+				assertRecoveryRunnerHasNoContinueFD(t, command)
+			}
+			assertChildGone(t, runner.configPath+".pid")
+		})
 	}
-	assertChildGone(t, runner.configPath+".pid")
 }
 
 func TestHelperAndGrandchildExitWhenLauncherIsKilled(t *testing.T) {
@@ -695,15 +726,28 @@ func TestRunnerCancelAfterWaitIsIdempotent(t *testing.T) {
 
 func TestRunnerCollapsesCrashAndMalformedOutput(t *testing.T) {
 	fixture := newHelperFixture(t)
-	for _, action := range []string{"crash", "oversized", "trailing", "valid-nonzero"} {
-		t.Run(action, func(t *testing.T) {
-			runner := testRunner(t, action, 10*time.Second)
-			_, err := runner.Run(context.Background(), ModeHardware, Request{Envelope: fixture.hardwareEnvelope})
-			if ErrorClassOf(err) != ErrorHelper {
-				t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorHelper)
-			}
-			if strings.Contains(err.Error(), "private PIN") || strings.Contains(err.Error(), "recovery identity") {
-				t.Fatal("runner error included child stderr")
+	for _, test := range runnerModeCases(fixture) {
+		t.Run(test.name, func(t *testing.T) {
+			for _, action := range []string{"crash", "oversized", "trailing", "valid-nonzero"} {
+				t.Run(action, func(t *testing.T) {
+					runner := testRunner(t, action, 10*time.Second)
+					var command *exec.Cmd
+					runner.command = func(path string) *exec.Cmd {
+						command = exec.Command(path)
+						return command
+					}
+					_, err := runner.Run(context.Background(), test.mode, Request{Envelope: test.envelope})
+					if ErrorClassOf(err) != ErrorHelper {
+						t.Fatalf("error class = %q, want %q", ErrorClassOf(err), ErrorHelper)
+					}
+					if strings.Contains(err.Error(), "private PIN") || strings.Contains(err.Error(), "recovery identity") {
+						t.Fatal("runner error included child stderr")
+					}
+					assertRunnerCommandReaped(t, command)
+					if test.mode == ModeRecovery {
+						assertRecoveryRunnerHasNoContinueFD(t, command)
+					}
+				})
 			}
 		})
 	}
@@ -738,6 +782,41 @@ func testRunner(t *testing.T, action string, timeout time.Duration) *Runner {
 	}
 	configPath := filepath.Join(t.TempDir(), runnerChildPrefix+action)
 	return NewRunner(executable, configPath, timeout)
+}
+
+type runnerModeCase struct {
+	name     string
+	mode     Mode
+	envelope ageprofile.Envelope
+}
+
+func runnerModeCases(fixture helperFixture) []runnerModeCase {
+	return []runnerModeCase{
+		{name: "hardware", mode: ModeHardware, envelope: fixture.hardwareEnvelope},
+		{name: "recovery", mode: ModeRecovery, envelope: fixture.recoveryEnvelope},
+	}
+}
+
+func assertRunnerCommandReaped(t *testing.T, command *exec.Cmd) {
+	t.Helper()
+	if command == nil || command.ProcessState == nil {
+		t.Fatal("runner returned before the helper was reaped")
+	}
+}
+
+func assertRecoveryRunnerHasNoContinueFD(t *testing.T, command *exec.Cmd) {
+	t.Helper()
+	if command == nil {
+		t.Fatal("runner did not construct a recovery helper command")
+	}
+	if len(command.ExtraFiles) != 1 {
+		t.Fatalf("recovery extra files = %d, want parent-watch fd only", len(command.ExtraFiles))
+	}
+	for _, entry := range command.Env {
+		if strings.HasPrefix(entry, hardwareContinueEnvironment+"=") {
+			t.Fatal("recovery helper received a hardware continue descriptor")
+		}
+	}
 }
 
 func waitForPIDFile(t *testing.T, path string) int {

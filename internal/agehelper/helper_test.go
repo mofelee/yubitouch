@@ -178,6 +178,66 @@ func TestInternalRecoverySuccessResolvesIdentityExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestInternalRecoveryResolverErrorIsUnavailable(t *testing.T) {
+	fixture := newHelperFixture(t)
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	input := framedRequest(t, Request{Envelope: fixture.recoveryEnvelope}, ModeRecovery)
+	var output bytes.Buffer
+	resolveCalls := 0
+	deps := successfulDependencies(fixture)
+	deps.resolveRecovery = func(_ context.Context, account, reference string) (string, error) {
+		resolveCalls++
+		if account != fixture.cfg.OnePasswordAccount || reference != fixture.recoveryIdentityRef {
+			t.Fatal("recovery helper changed the account or identity reference")
+		}
+		return fixture.recoveryIdentity, errors.New(fixture.recoveryIdentityRef + ": " + fixture.recoveryIdentity)
+	}
+
+	handled, code := runInternal(context.Background(), &input, &output, helperEnvironment(configPath, ModeRecovery), "/home/test", deps)
+	response := append([]byte(nil), output.Bytes()...)
+	if !handled || code != helperFailureExitCode || responseErrorClass(t, &output) != ErrorRecoveryUnavailable {
+		t.Fatalf("handled = %t, code = %d, resolver calls = %d", handled, code, resolveCalls)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolver calls = %d, want 1", resolveCalls)
+	}
+	if bytes.Contains(response, []byte(fixture.recoveryIdentityRef)) || bytes.Contains(response, []byte(fixture.recoveryIdentity)) {
+		t.Fatal("recovery error response leaked the identity or reference")
+	}
+}
+
+func TestInternalRecoveryUnparseableIdentityIsUnavailable(t *testing.T) {
+	fixture := newHelperFixture(t)
+	invalidIdentity := strings.Repeat("x", 74)
+	if len(fixture.recoveryIdentity) != len(invalidIdentity) {
+		t.Fatalf("fixture identity length = %d, want %d", len(fixture.recoveryIdentity), len(invalidIdentity))
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	input := framedRequest(t, Request{Envelope: fixture.recoveryEnvelope}, ModeRecovery)
+	var output bytes.Buffer
+	resolveCalls := 0
+	deps := successfulDependencies(fixture)
+	deps.resolveRecovery = func(_ context.Context, account, reference string) (string, error) {
+		resolveCalls++
+		if account != fixture.cfg.OnePasswordAccount || reference != fixture.recoveryIdentityRef {
+			t.Fatal("recovery helper changed the account or identity reference")
+		}
+		return invalidIdentity, nil
+	}
+
+	handled, code := runInternal(context.Background(), &input, &output, helperEnvironment(configPath, ModeRecovery), "/home/test", deps)
+	response := append([]byte(nil), output.Bytes()...)
+	if !handled || code != helperFailureExitCode || responseErrorClass(t, &output) != ErrorRecoveryUnavailable {
+		t.Fatalf("handled = %t, code = %d, resolver calls = %d", handled, code, resolveCalls)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolver calls = %d, want 1", resolveCalls)
+	}
+	if bytes.Contains(response, []byte(fixture.recoveryIdentityRef)) || bytes.Contains(response, []byte(invalidIdentity)) {
+		t.Fatal("recovery error response leaked the identity or reference")
+	}
+}
+
 func TestInternalHardwareReadyContinueOrder(t *testing.T) {
 	fixture := newHelperFixture(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
