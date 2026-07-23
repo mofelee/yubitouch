@@ -54,12 +54,15 @@ age -d -i identity.txt -o secret.txt secret.txt.age
 
 Encryption uses only public recipient material and does not contact the daemon, YubiKey, or
 1Password. Decryption uses the private age socket. A connected target always selects PIV X25519.
-The isolated helper completes the configured PIN provider and YKCS11 login first. The daemon shows
-the native touch prompt only after both succeed and before allowing hardware ECDH to continue.
-Only two consecutive successful target probes returning `not_detected` can start one recovery
-helper. A different device, target/key mismatch, unknown probe state, PIN/provider failure, user
-cancel, touch timeout, or YKCS11/ECDH/KDF/AEAD failure fails closed with no recovery call. A request
-that has selected hardware never switches to recovery.
+The daemon starts a persistent isolated hardware helper and obtains the PIN through a one-shot
+resolver that exits before YKCS11 login. The native touch prompt appears only after resolution and
+login succeed. A successful authenticated session can be reused by later requests in the same
+daemon, but every ECDH still requires an independent touch. Device events, reloads, cancellation,
+timeouts, protocol or PKCS#11 errors, and helper failure destroy the session. Only two consecutive
+successful target probes returning `not_detected` can start a one-shot recovery helper. A different
+device, target/key mismatch, unknown probe state, PIN/provider failure, user cancel, touch timeout,
+or YKCS11/ECDH/KDF/AEAD failure fails closed with no recovery call. A request that has selected
+hardware never switches to recovery.
 
 The v1 format uses independent ephemeral X25519 wraps, HKDF-SHA256 with domain-separated salt/info
 that binds the ephemeral and recipient public keys, and ChaCha20-Poly1305 authenticated wrapping of
@@ -107,13 +110,16 @@ DebianForm, full-screen UI, Developer ID signing, and notarization require recor
 
 The age PIV ECDH prerequisite and the complete signed-source-build hardware `age -R`/`age -d -i`
 flow are verified on arm64 macOS with YubiKey firmware 5.7.4, YKCS11 2.7.3, and age v1.3.1.
-Two consecutive hardware decryptions succeeded and matched the plaintext; while the 1Password PIN
-provider authorization was deliberately left pending, the YubiTouch touch UI remained hidden and
-appeared only after authorization completed. Real recovery success, authorization rejection,
-timeout, helper crash, and identity-mismatch paths remain pending and must not be inferred from unit
-tests.
-Wrong-PIN testing consumes device retries and should only be performed on a prepared test device
-with a confirmed recovery plan.
+Hardware success, touch cancellation, and touch timeout were exercised with the native UI; those
+results and the automated hardware fault matrix all remained fail-closed with no recovery call.
+Recovery success, authorization rejection, timeout, client cancellation, helper crash, identity
+parse failure, and recipient mismatch were exercised with 1Password Desktop App 8.12.28 and SDK
+v0.4.0. Recovery helpers and process groups were reaped in every result. The SDK does not currently
+honor caller context cancellation, so an app-owned authorization window can remain after YubiTouch
+has reaped its helper and must be closed manually. Wrong-PIN behavior is covered by single-attempt
+fault injection without a recovery call; it was not exercised on the daily-use device because it
+consumes finite retries. Authenticated hardware-session reuse and invalidation after device
+reinsertion were also verified on arm64.
 
 Replacing the X25519 key in the same configured serial and slot does not automatically invalidate
 the cached `age.public_key` in this release. Stop the daemon, remove only that JSON field, regenerate

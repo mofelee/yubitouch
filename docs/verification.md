@@ -38,6 +38,7 @@ command -v age-plugin-yubitouch
 | 日期 | macOS/build | 架构 | YubiTouch commit | OpenSSH | yubico-piv-tool | ykman | 1Password/SDK | 结果 |
 |---|---|---|---|---|---|---|---|---|
 | 2026-07-19 | macOS 27.0 (26A5378n) | arm64 | db436e2 | Apple 10.3p1; Homebrew 10.4p1 | 2.7.3 | 5.9.2 | SDK v0.4.0 | pass (#20) |
+| 2026-07-23 | macOS 27.0 | arm64 | 2b69fc9 (#23); 9c5324a (#21) | 未涉及 | 2.7.3 | 5.9.2 | App/Build 8.12.28; CLI 2.35.0; SDK v0.4.0 | pass (#21, #23) |
 
 ## YubiKey 与签名
 
@@ -98,6 +99,7 @@ launcher 后确认两者都在短时限内消失。
 |---|---|---|---|---|---|---|---|
 | 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | PIV 82 X25519/YKCS11 ECDH spike | pass |
 | 2026-07-22 | macOS 27.0 (26A5388g) | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | 签名 App：公开描述符、离线加密、硬件解密及 1Password PIN/触摸时序 | pass（连续 2 次解密） |
+| 2026-07-23 | macOS 27.0 | arm64 | 5.7.4 | 2.7.3 | v1.3.1 | 9c5324a 签名 App：hardware 失败闭合及完整 1Password recovery 矩阵 | pass (#21) |
 
 arm64 spike 使用用户预先配置的 PIV 82 X25519 key，策略为 PIN `ONCE`、touch `ALWAYS`。
 已确认无 PIN/login 可读取规范的 32 字节公钥，登录并触摸后
@@ -105,9 +107,9 @@ arm64 spike 使用用户预先配置的 PIV 82 X25519 key，策略为 PIN `ONCE`
 验证过程没有生成、导入、覆盖、删除或修改任何硬件 key，也没有记录完整设备 serial、PIN、
 ECDH 输入、shared secret 或 file key。
 
-第一条 spike 只解除 arm64 硬件能力的前置阻断；第二条记录完成了源码签名 App 的公开
-recipient/identity、无 daemon/设备的离线加密，以及硬件主路径端到端解密。它不代表任何
-真实 1Password recovery 路径已通过。
+第一条 spike 只解除 arm64 硬件能力的前置阻断；第二条是公开 recipient/identity、无
+daemon/设备的离线加密和硬件主路径端到端解密的历史基线，当时没有验证 recovery。第三条
+使用独立的 1Password recovery identity 完成缺卡恢复和异常矩阵，并补齐真实触摸取消与超时。
 
 ### 安装、格式与离线加密
 
@@ -200,28 +202,39 @@ yubitouch status --json | jq '{
 }'
 ```
 
-| 场景 | 预期 backend | recovery 调用 | 预期结果 | arm64 |
+| 场景 | 预期 backend | recovery 调用 | 预期结果 | 验证结果 |
 |---|---|---:|---|---|
-| 目标设备连接且解密成功 | hardware | 0 | success | pass（连续 2 次；PIN 授权结束后才显示触摸） |
-| 插入其他 YubiKey | none | 0 | target mismatch | pending |
-| serial/slot/public key 不匹配 | none | 0 | target mismatch | pending |
-| 探测失败或状态不明 | none | 0 | probe unavailable | pending |
-| PIN provider 失败/取消 | hardware | 0 | fail closed | pending |
-| 触摸取消 | hardware | 0 | canceled | pending |
-| 触摸超时 | hardware | 0 | timeout | pending |
-| 设备在操作中移除 | hardware | 0 | fail closed | pending |
-| YKCS11/ECDH/KDF/AEAD 失败 | hardware | 0 | fail closed | pending |
+| 目标设备连接且解密成功 | hardware | 0 | success | pass（arm64 真机；PIN 授权结束后才显示触摸） |
+| 插入其他 YubiKey | none | 0 | target mismatch | pass（自动化故障注入） |
+| serial/slot/public key 不匹配 | none | 0 | target mismatch | pass（自动化故障注入） |
+| 探测失败或状态不明 | none | 0 | probe unavailable | pass（自动化故障注入） |
+| PIN provider 失败/取消 | hardware | 0 | fail closed | pass（自动化故障注入；无自动重试） |
+| 错误 PIN/YKCS11 login 拒绝 | hardware | 0 | fail closed | pass（自动化；单次尝试，未在日常设备真机执行） |
+| 触摸取消 | hardware | 0 | canceled | pass（arm64 真机） |
+| 触摸超时 | hardware | 0 | `timeout` 或闭合的 hardware failure | pass（arm64 真机；约 21 秒后 `hardware_failed`） |
+| 设备在操作中移除 | hardware | 0 | fail closed | pass（自动化故障注入） |
+| YKCS11/ECDH/KDF/AEAD 失败 | hardware | 0 | fail closed | pass（自动化故障注入） |
 
 2026-07-22 的 arm64 隔离验收使用 1Password PIN provider。两次请求都在 Desktop App 授权
 窗口保持未完成时等待，期间没有出现 YubiTouch 触摸面板；授权完成后才显示“age 解密”触摸
 提示。两次触摸后 `age` 均以 0 退出，解密结果均与原文匹配，脱敏状态依次记录
 `age_hardware_selected` 和 `age_decrypt_succeeded`。本次配置未启用 recovery，因此不改变下方
-真实 recovery 矩阵的 `pending` 状态。这是 #21 每次启动一次性 hardware helper 的历史基线，
-不能作为 #23 session 复用已经通过的证据。
+真实 recovery 矩阵的状态。该次使用的是每个请求启动一次 hardware helper 的历史实现，不能
+作为 #23 session 复用已经通过的证据。
+
+矩阵结果明确标注真机或自动化；故障注入只证明错误分类、资源回收和 recovery 零调用，不替代
+PIN、触摸或 UI 真机事实。2026-07-23 在启用 recovery 的同一 arm64 配置上补测 hardware。真实
+触摸取消返回 `backend=hardware result=canceled`；源码签名 App
+`issue21-retest (9c5324a6bf04)` 的全新 daemon 上不触摸时，底层 hardware 操作约 21 秒后返回
+`backend=hardware result=hardware_failed`。两次均未输出明文，`recovery_selected=0`，helper
+计数为 0，daemon、age socket 和 SSH route 保持不变。超时测试只出现一次 1Password PIN
+授权和一次触摸面板；失败返回后面板自动关闭，没有第二次授权或其他 UI。其余 mismatch、
+probe、PIN/provider、设备移除和 PKCS#11/ECDH 故障由 race 自动化矩阵断言 recovery 调用为 0。
 
 错误 PIN 会消耗 YubiKey 的有限重试次数。只允许在已确认剩余次数、拥有可靠恢复方案且专门
 用于测试的设备上验证；不得为了补齐矩阵而对日常使用设备尝试错误 PIN，并确认实现不会自动
-重试。任何已经选择 hardware 的请求都不得在同一次请求中改走 recovery。
+重试。#21 没有在日常设备上输入错误 PIN；该路径由自动化故障注入覆盖一次调用、无重试和
+recovery 零调用。任何已经选择 hardware 的请求都不得在同一次请求中改走 recovery。
 
 另以一个等待中的 SSH 签名和一个 age 解密互换先后顺序，确认两者共享全局 PIV 队列且一次
 只有一个进入 PIN/触摸/私钥操作。取消仍在排队的请求时，不得启动其 PIN、UI 或 PIV 操作；
@@ -229,9 +242,9 @@ yubitouch status --json | jq '{
 
 ### 已认证 hardware session 复用（#23）
 
-本节只验收 arm64 源码签名 App，初始结果一律为 `pending`。自动化测试通过不能代替真实
-`PIN=ONCE, touch=ALWAYS` YubiKey、1Password/PIN provider、触摸和设备拔插结果，也不能把
-Issue #21 的连续两次一次性解密结果沿用为 #23 的通过记录。
+本节于 2026-07-23 完成 arm64 源码签名 App 真机验收。自动化测试通过不能代替真实
+`PIN=ONCE, touch=ALWAYS` YubiKey、1Password/PIN provider、触摸和设备拔插结果；下方结果
+来自 #23 独立测试，不沿用 Issue #21 的连续两次一次性解密记录。
 
 hardware 路径由 daemon 管理的隔离常驻 helper 持有已认证 YKCS11 session。第一次请求的
 PIN resolver 仍是一次性进程：它发送有界响应后退出并被 `wait` 回收，hardware helper 此后才
@@ -308,9 +321,14 @@ printf 'reinserted_exit=%d plaintext_match=%s\n' "$issue23_status" "$issue23_mat
 
 | arm64 场景 | PIN provider/login | 触摸 | 明文匹配 | 当前结果 |
 |---|---|---|---|---|
-| daemon 重载后的第一次解密 | 1 次 | 1 次 | yes | pending |
-| 同一 session 的第二次解密 | 0 次 | 1 次 | yes | pending |
-| 拔出并重新插入后的第一次解密 | 1 次 | 1 次 | yes | pending |
+| daemon 重载后的第一次解密 | 1 次 | 1 次 | yes | pass (#23) |
+| 同一 session 的第二次解密 | 0 次 | 1 次 | yes | pass (#23) |
+| 拔出并重新插入后的第一次解密 | 1 次 | 1 次 | yes | pass (#23) |
+
+2026-07-23 使用 arm64 源码签名 App `issue23-test (2b69fc9e21e8)` 完成三段真机验收。首次
+解密授权一次并触摸一次；同一 daemon/session 的第二次解密没有 PIN/1Password 授权，只触摸
+一次；设备拔出并重新插入后再次授权一次、触摸一次。三次均恢复同一明文，授权结束前均未
+提前显示触摸面板，daemon 和 age socket 全程保持可用。Issue #23 的 13 项清单全部通过。
 
 真机报告只记录三行退出码/匹配结果、上述 UI 次数、版本和 Issue 链接。一次登录、两次独立
 derive，以及 resolver 已在 login 前退出回收，还必须与自动化/故障注入证据一起判断；不要为
@@ -337,16 +355,26 @@ recovery helper，不能先尝试 hardware ECDH，也不能改变 SSH `agent_rou
 
 | 真实 recovery 场景 | helper 退出/回收 | 自动重试 | 明文/失败 | 当前结果 |
 |---|---|---:|---|---|
-| 成功授权且 identity 匹配 | 必须 | 0 | 明文匹配 | pending |
-| 用户拒绝/取消 1Password 授权 | 必须 | 0 | 失败 | pending |
-| helper/SDK 超时或客户端取消 | 必须 | 0 | 失败 | pending |
-| helper 崩溃/异常退出 | 必须 | 0 | 失败 | pending |
-| identity 与配置 recipient 不匹配 | 必须 | 0 | 失败 | pending |
+| 成功授权且 identity 匹配 | 必须 | 0 | 明文匹配 | pass（arm64 真机） |
+| 用户拒绝/取消 1Password 授权 | 必须 | 0 | `recovery_unavailable` / `backend_unavailable` | pass（arm64 真机） |
+| SDK/helper 超时 | 必须 | 0 | `timeout` | pass（arm64 真机；31 秒） |
+| 客户端断开/取消 | 必须 | 0 | `canceled` | pass（arm64 真机；立即回收） |
+| helper 崩溃/异常退出 | 必须 | 0 | `recovery_failed` / `internal` | pass（arm64 真机；进程组回收） |
+| identity 无法解析 | 必须 | 0 | `recovery_unavailable` / `backend_unavailable` | pass（arm64 真机） |
+| identity 与配置 recipient 不匹配 | 必须 | 0 | `recovery_failed` / `internal` | pass（arm64 真机） |
 
-截至 2026-07-22，上表全部是真实环境待验证项，不得依据 mock、单元测试或 arm64 硬件 spike
-改为 `pass`。验收时确认没有孤儿 helper、临时 secret 文件或持久化 identity；1Password SDK
-返回的不可变 Go `string` 无法可靠清零，必须把禁用 core dump、短 helper 生命周期和进程退出
-作为主要隔离边界，不能宣称达到硬件私钥不可导出的安全级别。
+2026-07-23 使用源码签名 App `0.1.0 (9c5324a6bf04)`、1Password App/Build 8.12.28、CLI 2.35.0
+和 SDK v0.4.0 完成上表。所有请求都只选择 recovery，没有 hardware 或触摸 UI，
+也没有改变 SSH route；成功后明文匹配，所有失败路径均无明文、无自动重试、无孤儿
+helper/plugin 或临时 secret 文件。客户端取消后的下一次请求仍成功。测试用临时 1Password
+item 已永久删除，18 个 fixture 文件和最终隔离 App/test 目录均已清理。
+
+进程清理与 1Password 所拥有的授权窗口必须分开判断。SDK v0.4.0 的 macOS backend 不响应
+调用方 context 取消（上游 #266）；在 recovery 超时、客户端断开或 helper 异常退出后，daemon
+已按预期回收 helper，但授权窗口仍可能停留，需要用户在 1Password 中手动取消。该限制没有
+触发 YubiTouch 触摸提示或第二次授权。SDK 返回的不可变 Go `string` 也无法可靠清零，必须把
+禁用 core dump、短 helper 生命周期和进程退出作为主要隔离边界，不能宣称达到硬件私钥不可
+导出的安全级别。
 
 启用 recovery 还意味着 hardware 与 recovery 是 OR 关系，任一私钥都能独立恢复 file key；
 验证报告必须明确这会把整份密文的整体安全级别降低到较弱路径。完成测试后删除临时目录，
